@@ -10,7 +10,7 @@
 # since there's no cluster of interest to report for them.
 #
 # .cdhit fasta headers and .cdhit.clstr member-line headers share the format
-# produced by manual_pipeline/overhangs.py's extract_overhangs_from_bam:
+# produced by scripts/overhangs.py's extract_overhangs_from_bam:
 #   {sample}|{read_id}|{is_element}|pos:{p}|side:{left,right}|strand:{+,-}|pident:{pct}
 # The .clstr file marks a cluster's representative sequence with a trailing "*";
 # every other member line ends with "at cstart:cend:rstart:rend/strand/pident%" (its

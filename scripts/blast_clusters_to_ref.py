@@ -1,5 +1,5 @@
 # purpose: BLAST cd-hit cluster representative sequences (overhang clusters from
-# manual_pipeline/overhangs.py + scripts/combine_cdhit_clusters.py) against the
+# scripts/overhangs.py + scripts/combine_cdhit_clusters.py) against the
 # masked (IS-excised) E. coli reference genomes, and determine whether the
 # IS-element insertion each overhang came from actually DISRUPTED a gene.
 #
@@ -12,7 +12,7 @@
 # gene, without the junction-relevant end actually landing inside it, is not a
 # disruption.
 #
-# Which end is junction-adjacent (traced in manual_pipeline/overhangs.py's
+# Which end is junction-adjacent (traced in scripts/overhangs.py's
 # extract_overhangs_from_bam, STAGE 3): for side=="left" the LAST base of the
 # written overhang is junction-adjacent (its aligned/IS-anchored portion
 # follows the clip in the read); for side=="right" the FIRST base is

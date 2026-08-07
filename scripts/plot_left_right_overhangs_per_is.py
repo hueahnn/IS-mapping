@@ -1,7 +1,7 @@
 # purpose: for a list of genome accessions, make one scatter plot per IS element
 # seen in that set, comparing each genome's deduplicated left vs. right overhang
 # cluster count (one point per genome). Variant of the aggregate-across-genomes
-# dot plot in manual_pipeline/reads.ipynb (cells 39-43), broken out per genome
+# dot plot in scripts/reads.ipynb (cells 39-43), broken out per genome
 # instead of summed across all of them.
 # usage:
 #   python plot_left_right_overhangs_per_is.py atb/ecoli_atb_sra_accessions_random10.txt

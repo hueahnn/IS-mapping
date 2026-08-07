@@ -226,7 +226,7 @@ rule clip_and_cluster:
 	group: "overhangs"
 	input:
 		bam=os.path.join(BAM_DIR, "{id}.bam"),
-		overhang_script=os.path.join(SCRIPT_DIR, "manual_pipeline", "overhangs.py"),
+		overhang_script=os.path.join(SCRIPT_DIR, "scripts", "overhangs.py"),
 		combine_script=os.path.join(SCRIPT_DIR, "scripts", "combine_cdhit_clusters.py")
 	output:
 		overhang_manifest=os.path.join(OVERHANG_DIR, "{id}", "{id}.manifest.tsv"),
