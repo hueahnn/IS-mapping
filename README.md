@@ -106,3 +106,25 @@ the HMS O2 cluster but aren't checked in:
   config referenced by `--profile slurmprofile`).
 - **Scratch outputs**: all pipeline outputs live under
   `/n/scratch/users/h/hua575/atb_filtered/` and are not versioned.
+
+## To Dos for the Future
+
+- **Implement new clustering.** CD-HIT is alignment-based and clusters on percent
+  identity. Want to move to Levenshtein distance / Hamming distance, incorporating
+  positional start information and a count-based difference metric instead of %ID.
+  Look at the Slack messages with Jim on this. Consider the `block-aligner` package
+  (Rust + C).
+- **Use MAPQ for repeated genes.** When mapping overhang clusters to the reference
+  genome, gene repetitions cause ambiguous placement — use MAPQ score to handle this.
+  See ISMapper figure 2.
+- **Aggregate the output data.** Current output format is hard to parse. Look into
+  concatenating across accessions without producing absurdly large files, and
+  cross-referencing the cd-hit info, original reads/overhang info, and gene hits
+  together rather than as separate outputs.
+- **Broaden the reference genome set.** Align against a phylogenetically diverse set
+  of reference genomes (e.g. ~100) and compare what's conserved vs. not, instead of
+  just the current 6.
+- **Biological follow-ups to look into:**
+  - Megaplate data has a region mediated by transposons that causes a duplication.
+  - Cluster size correlates with coverage, which gives info about duplications.
+  - Genomic rearrangements: regions close together that look like inversion events.
