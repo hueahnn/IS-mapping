@@ -1,0 +1,108 @@
+# IS-mapping
+
+Pipeline for detecting IS-element (insertion sequence) transposition events across a
+large collection of *E. coli* short-read SRA accessions, and classifying whether each
+insertion disrupted a gene.
+
+At a high level: download reads for an accession, align them to the ISfinder IS-element
+database, extract and cluster the sequence "overhangs" flanking every IS hit, BLAST
+those clusters against masked (IS-excised) *E. coli* reference genomes to classify
+whether the insertion landed inside a gene, and pair up left/right overhang clusters
+that correspond to the same insertion junction.
+
+## Running the pipeline
+
+The core per-accession pipeline is a Snakemake workflow:
+
+```
+snakemake --profile slurmprofile --rerun-incomplete --use-conda --executor slurm
+```
+
+`Snakefile` chains together: `prefetch` → `fasterq` → `bwa_isfinder` → `remove_fastqs`
+→ `clip_and_cluster` (overhang extraction + cd-hit clustering) → `blast_clusters_to_ref`
+(gene-disruption classification) → `add_pairing_column` (left/right junction pairing).
+It runs against `atb/ecoli_atb_sra_accessions.txt` by default (override with
+`--config input_path=...`), and can rerun the gene-disruption step against a second,
+ISfinder-BLAST-based masking strategy via the `gene_disruption_v2_all` target.
+
+Everything else in the repo is analysis run on top of that pipeline's output — pooling
+results across accessions, plotting, summarizing, or re-running a stage at a different
+scope (e.g. per IS element instead of per accession).
+
+## Repository layout
+
+### `Snakefile`
+The per-accession pipeline described above.
+
+### `scripts/`
+Scripts invoked by the Snakefile, plus downstream analysis run standalone.
+
+| file | purpose |
+|---|---|
+| `overhangs.py` | 4-stage filter (coverage → per-read quality → per-IS-element hit count → FASTA extraction) that pulls soft-clipped overhang reads out of a BAM. Used by the `clip_and_cluster` rule. |
+| `combine_cdhit_clusters.py` | Merges one sample's cd-hit cluster + representative-sequence output into a single `reads.tsv`, dropping singleton clusters. Used by `clip_and_cluster`. |
+| `blast_clusters_to_ref.py` | BLASTs cluster representatives against the masked reference genomes and classifies gene disruption at the insertion junction. Used by the `blast_clusters_to_ref` rule. |
+| `masking.py` | Builds the masked reference genomes: BLASTs each *E. coli* reference against ISfinder and excises matching regions from both FASTA and GBFF. |
+| `cluster_global_reps.py` | Pools every accession's cluster representatives (by side, across all IS elements) and re-clusters at the global level. |
+| `cluster_and_align_by_is.py` | Same idea scoped to specific IS elements: pools raw overhangs for those elements across all accessions, re-clusters, BLASTs, and pairs junctions. |
+| `pool_reps_min_size.py` | Filters existing per-accession cluster reps by minimum cluster size and merges them into one FASTA (no re-clustering). |
+| `plot_left_right_overhangs_per_is.py` | One scatter plot per IS element: genome-by-genome left vs. right deduplicated overhang counts. |
+| `summarize_gene_disruption_v2.py` | Streams every `gene_disruption_v2/*.zip` and tallies cluster counts by `hit_type` and pairing status. |
+| `build_atb_species_table.py` | For a given species, builds the accession list (ATB query → BioSample IDs → SRA coverage filter) that feeds the Snakefile's `ACCESSIONS_PATH`. |
+| `reads.ipynb` | Exploratory notebook from early pipeline development (minibwa hit counts, gbff parsing, insertion-site BAM inspection). |
+
+### `pairing/`
+| file | purpose |
+|---|---|
+| `add_pairing_column.py` | Adds a `pairing` column to gene-disruption TSVs, matching left/right overhang clusters that land at the same insertion junction within a max gap. |
+| `run_pairing.sbatch` | SLURM array job running `add_pairing_column.py` over chunked zip lists. |
+
+### `clustering/`
+| file | purpose |
+|---|---|
+| `filter_cdhit_reps.py` | Filters a cd-hit representative FASTA down to clusters larger than a minimum size, using the matching `.clstr` file. |
+
+### `coverage_plots/`
+| file | purpose |
+|---|---|
+| `align_to_masked_refs.sbatch` | Array job: BWA-aligns the merged, size-filtered cluster-rep FASTA against each of the 6 masked (v1) reference genomes. |
+| `align_to_masked_refs_v2.sbatch` | Same, against the v2 (ISfinder-BLAST-masked) reference genomes. |
+
+### `is_level/`
+| file | purpose |
+|---|---|
+| `align_is_clusters_to_masked_refs_v2.sbatch` | Array job: BWA-aligns one IS element's pooled cluster reps (from `cluster_and_align_by_is.py`) against the 6 v2 masked reference genomes. |
+
+### `is_coverage/`
+| file | purpose |
+|---|---|
+| `extract_is_coverage.py` | Computes per-(genome, IS element) coverage stats (mean/variance depth, full-length and edge windows) from BAMs aligned to ISfinder. |
+| `coverage.ipynb` | Notebook validating `extract_is_coverage.py`'s output. |
+
+### `insertion_event_counts/`
+| file | purpose |
+|---|---|
+| `count_is_events.py` | Counts distinct insertion events per IS element by treating paired left/right clusters as edges in a graph and counting connected components, avoiding double-counting a junction across sides or reference genomes. |
+
+### `ecoli_genomes_metadata/`
+| file | purpose |
+|---|---|
+| `sra_table.ipynb` | Notebook exploring the NCBI SRA accession table and filtering it down to *E. coli* BioSamples. |
+
+### `analysis.ipynb`
+Notebook of plots/numbers assembled for presenting pipeline results.
+
+## Not tracked in this repo
+
+This repo holds pipeline code only. It depends on data and infrastructure that live on
+the HMS O2 cluster but aren't checked in:
+
+- **Reference data**: `atb/`, `ref_genomes/`, `ISfinder_database-master_2026/` (IS
+  database + masked reference genomes and BLAST dbs).
+- **Conda environments**: paths under `/home/hua575/miniconda3/envs/` (`minibwa`,
+  `cd-hit`, `blast`, `bakta`, `ncbi-datasets`, `ismapper`) and `.yaml` env specs under
+  `/home/hua575/baymlab/sibmi/conda-envs/`.
+- **Snakemake profile**: `slurmprofile/config.yaml` (SLURM resource/group-component
+  config referenced by `--profile slurmprofile`).
+- **Scratch outputs**: all pipeline outputs live under
+  `/n/scratch/users/h/hua575/atb_filtered/` and are not versioned.
