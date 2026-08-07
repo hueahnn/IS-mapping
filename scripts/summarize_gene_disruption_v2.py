@@ -1,4 +1,4 @@
-# purpose: stream every {accession}.zip in gene_disruption_v2/ (one zip per
+# purpose: stream every {accession}.zip in gene_disruption/ (one zip per
 # accession, one {is_element}.tsv per IS element that accession had clusters
 # for -- see blast_clusters_to_ref.py's write_split_tables), and tally, across
 # EVERY accession and EVERY IS element, how many clusters with >= min_size
@@ -23,7 +23,7 @@ import sys
 import zipfile
 from pathlib import Path
 
-DEFAULT_DIR = Path("/n/scratch/users/h/hua575/atb_filtered/gene_disruption_v2")
+DEFAULT_DIR = Path("/n/scratch/users/h/hua575/atb_filtered/gene_disruption")
 
 # a cluster can have multiple hit rows (one per ref_genome it hit, or >1
 # overlapping gene at the same locus via gene_rank) -- collapse to one

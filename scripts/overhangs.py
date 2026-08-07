@@ -167,8 +167,6 @@ def filter_by_is_coverage(bam_path: str, output_bam_path: str,
     print(f"Wrote {written} records ({n_pass} distinct IS elements) to {output_bam_path}")
     print(f"{len(qualifying_is)} IS elements above coverage threshold: {qualifying_is}")
 
-    failing = sorted(set(depth) - qualifying_is)
-
     return qualifying_is
 
 

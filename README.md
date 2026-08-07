@@ -1,14 +1,15 @@
 # IS-mapping
 
-Pipeline for detecting IS-element (insertion sequence) transposition events across a
-large collection of *E. coli* short-read SRA accessions, and classifying whether each
-insertion disrupted a gene.
+Pipeline for detecting insertions of every IS element (insertion sequence) in the
+ISfinder database across a large collection of *E. coli* short-read SRA accessions, and
+classifying whether each insertion disrupted a gene.
 
-At a high level: download reads for an accession, align them to the ISfinder IS-element
-database, extract and cluster the sequence "overhangs" flanking every IS hit, BLAST
-those clusters against masked (IS-excised) *E. coli* reference genomes to classify
-whether the insertion landed inside a gene, and pair up left/right overhang clusters
-that correspond to the same insertion junction.
+At a high level: download reads for an accession, align them to the full ISfinder
+IS-element database (not just one IS element — every one it contains), extract and
+cluster the sequence "overhangs" flanking every IS hit, BLAST those clusters against
+masked (IS-excised) *E. coli* reference genomes to classify whether the insertion landed
+inside a gene, and pair up left/right overhang clusters that correspond to the same
+insertion junction.
 
 ## Running the pipeline
 
@@ -22,8 +23,7 @@ snakemake --profile slurmprofile --rerun-incomplete --use-conda --executor slurm
 → `clip_and_cluster` (overhang extraction + cd-hit clustering) → `blast_clusters_to_ref`
 (gene-disruption classification) → `add_pairing_column` (left/right junction pairing).
 It runs against `atb/ecoli_atb_sra_accessions.txt` by default (override with
-`--config input_path=...`), and can rerun the gene-disruption step against a second,
-ISfinder-BLAST-based masking strategy via the `gene_disruption_v2_all` target.
+`--config input_path=...`).
 
 Everything else in the repo is analysis run on top of that pipeline's output — pooling
 results across accessions, plotting, summarizing, or re-running a stage at a different
@@ -47,7 +47,7 @@ Scripts invoked by the Snakefile, plus downstream analysis run standalone.
 | `cluster_and_align_by_is.py` | Same idea scoped to specific IS elements: pools raw overhangs for those elements across all accessions, re-clusters, BLASTs, and pairs junctions. |
 | `pool_reps_min_size.py` | Filters existing per-accession cluster reps by minimum cluster size and merges them into one FASTA (no re-clustering). |
 | `plot_left_right_overhangs_per_is.py` | One scatter plot per IS element: genome-by-genome left vs. right deduplicated overhang counts. |
-| `summarize_gene_disruption_v2.py` | Streams every `gene_disruption_v2/*.zip` and tallies cluster counts by `hit_type` and pairing status. |
+| `summarize_gene_disruption_v2.py` | Streams every `gene_disruption/*.zip` and tallies cluster counts by `hit_type` and pairing status. |
 | `build_atb_species_table.py` | For a given species, builds the accession list (ATB query → BioSample IDs → SRA coverage filter) that feeds the Snakefile's `ACCESSIONS_PATH`. |
 | `reads.ipynb` | Exploratory notebook from early pipeline development (minibwa hit counts, gbff parsing, insertion-site BAM inspection). |
 

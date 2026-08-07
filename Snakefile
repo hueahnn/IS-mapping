@@ -1,64 +1,48 @@
+# IS-element insertion pipeline: given a list of SRA accession IDs, downloads
+# each genome's reads, aligns them to the ISfinder IS-element database,
+# extracts and clusters the sequence "overhangs" flanking every IS hit, BLASTs
+# those clusters against masked E. coli reference genomes to classify whether
+# the insertion disrupted a gene, and pairs up left/right overhang clusters
+# that land at the same insertion junction.
 # begin: 06/18/2026
-# purpose: downloading fastq files from sra accession IDs. fastq file --> bwa align to isfinder db. for every IS hit, 
-# extract overhangs and cluster. align clusters to ref genome
-# command to run: snakemake --profile slurmprofile --rerun-incomplete --use-conda --executor slurm
+# run: snakemake --profile slurmprofile --rerun-incomplete --use-conda --executor slurm
 
 import os
 
-### global ####
-# old: pre atb db
-# ACCESSIONS_PATH = "/n/scratch/users/h/hua575/ecoli_sra_accessions_v3.txt"
-# PATH = "/n/scratch/users/h/hua575/v2"
-# FASTQ_DIR = os.path.join(PATH, "fastq-files-v2")
-# batches
-# BATCH_FILE = "/n/scratch/users/h/hua575/v2/fastq-file-names-1-random5.txt"
-# BATCH_FILE = "/n/scratch/users/h/hua575/v2/fastq-file-names-1-random10.txt"
-# BATCH_FILE = "/n/scratch/users/h/hua575/v2/fastq-file-names-1-random20.txt"
-# BATCH_FILE = "/n/scratch/users/h/hua575/v2/fastq-file-names-1-random100.txt"
-# BATCH_FILE = "/n/scratch/users/h/hua575/v2/fastq-file-names-1.txt"
-
-# new: using atb db filtered (149k IDs)
+# accession list to run the pipeline over
 ACCESSIONS_PATH = config.get("input_path", "/home/hua575/baymlab/mapping/atb/ecoli_atb_sra_accessions.txt")
-PATH = "/n/scratch/users/h/hua575/atb_filtered"
-# PATH = "/n/scratch/users/h/hua575/test0708"
-FASTQ_DIR = os.path.join(PATH, "fastq-files")
-# batches
-# BATCH_FILE = "/home/hua575/baymlab/mapping/atb/ecoli_atb_sra_accessions_random10.txt"
-# BATCH_FILE = "/home/hua575/baymlab/mapping/atb/ecoli_atb_sra_accessions_random10_2.txt"
-BATCH_FILE = "/home/hua575/baymlab/mapping/atb/ecoli_atb_sra_accessions_random1000.txt"
-# BATCH_FILE = "/home/hua575/baymlab/mapping/atb/ecoli_atb_sra_accessions_2000.txt"
-# BATCH_FILE = "/home/hua575/baymlab/mapping/atb/ecoli_atb_sra_accessions_2000_2.txt"
-# BATCH_FILE = "/home/hua575/baymlab/mapping/atb/ecoli_atb_sra_accessions_tail_5000.txt"
-
-### local rules ###
-IS_DB = "ISfinder_database-master_2026/IS.database.collapsed99.fa" # bwa_isfinder
-BAM_DIR = os.path.join(PATH, "bam-files") # bwa_isfinder
-# BAM_DIR = os.path.join("/home/hua575/baymlab/mapping/", "bam-files") # bwa_isfinder
-OVERHANG_DIR = os.path.join(PATH, "overhangs") # clip_and_cluster
-SCRIPT_DIR = "/n/data1/hms/dbmi/baym/hue/mapping" # clip_and_cluster
-REMOVE_DIR = os.path.join(PATH, "removed") # remove_fastqs
-CDHIT_DIR = os.path.join(PATH, "cd-hit") # clip_and_cluster
-
-GENE_DISRUPTION_DIR = os.path.join(PATH, "gene_disruption") # blast_clusters_to_ref
-REF_GENOMES_DIR = "/home/hua575/baymlab/mapping/ref_genomes/ecoli" # blast_clusters_to_ref
-BLASTDB = "/home/hua575/baymlab/mapping/ref_genomes/blastdb/ecoli_masked_combined" # blast_clusters_to_ref
-REF_ACCESSIONS = [ # blast_clusters_to_ref -- must match the accessions the BLASTDB was built from
-	"GCA_000005845.2", "GCA_900096825.1", "GCA_000692435.1",
-	"GCA_002473875.1", "GCA_000163235.1", "GCA_002966755.1",
-]
-REF_ACCESSIONS_STR = " ".join(REF_ACCESSIONS) # blast_clusters_to_ref -- shell {}-formatting can't eval " ".join(...) inline
-
-# v2 masked ref genomes: masking.py's ISfinder-BLAST-based excision instead of
-# the original Bakta-/product-annotation regex -- see blast_clusters_to_ref_v2
-GENE_DISRUPTION_DIR_V2 = os.path.join(PATH, "gene_disruption_v2") # blast_clusters_to_ref_v2
-BLASTDB_V2 = "/home/hua575/baymlab/mapping/ref_genomes/blastdb/ecoli_masked_combined_v2" # blast_clusters_to_ref_v2
-
-# change input to whatever file of accessions (if breaking into chunks, can split up original v3 accession file)
 with open(ACCESSIONS_PATH) as f:
 	ACCESSIONS = [line.strip() for line in f if line.strip()]
 
-# accession IDs never contain a dot -- constrains {id} so it can't also match
-# "{id}.tar.gz", which would otherwise be ambiguous with the {id}.tar.gz archive outputs
+# scratch working directory holding all per-accession intermediate/output files
+PATH = "/n/scratch/users/h/hua575/atb_filtered"
+FASTQ_DIR = os.path.join(PATH, "fastq-files")                     # fasterq, bwa_isfinder, remove_fastqs
+BAM_DIR = os.path.join(PATH, "bam-files")                         # bwa_isfinder, clip_and_cluster
+REMOVE_DIR = os.path.join(PATH, "removed")                        # remove_fastqs
+OVERHANG_DIR = os.path.join(PATH, "overhangs")                    # clip_and_cluster
+CDHIT_DIR = os.path.join(PATH, "cd-hit")                          # clip_and_cluster, blast_clusters_to_ref
+GENE_DISRUPTION_DIR = os.path.join(PATH, "gene_disruption")       # blast_clusters_to_ref
+PAIRED_DIR = os.path.join(PATH, "gene_disruption_paired")         # add_pairing_column
+
+SCRIPT_DIR = "/n/data1/hms/dbmi/baym/hue/mapping"                   # clip_and_cluster, blast_clusters_to_ref, add_pairing_column
+IS_DB = "ISfinder_database-master_2026/IS.database.collapsed99.fa" # bwa_isfinder
+
+# reference genomes / BLAST db for blast_clusters_to_ref (masking.py's
+# ISfinder-BLAST-based excision -- see scripts/masking.py)
+REF_GENOMES_DIR = "/home/hua575/baymlab/mapping/ref_genomes/ecoli"
+REF_ACCESSIONS = [  # must match the accessions BLASTDB below was built from
+	"GCA_000005845.2", "GCA_900096825.1", "GCA_000692435.1",
+	"GCA_002473875.1", "GCA_000163235.1", "GCA_002966755.1",
+]
+REF_ACCESSIONS_STR = " ".join(REF_ACCESSIONS)  # shell {}-formatting can't eval " ".join(...) inline
+BLASTDB = "/home/hua575/baymlab/mapping/ref_genomes/blastdb/ecoli_masked_combined_v2"
+GBFF_SUFFIX = "no_IS_v2"
+REF_GBFFS = expand(
+	os.path.join(REF_GENOMES_DIR, "{acc}", "{acc}_" + GBFF_SUFFIX + ".gbff"), acc=REF_ACCESSIONS
+)
+
+# accession IDs never contain a dot, so {id} can't ambiguously match a
+# "{id}.tar.gz" archive output.
 wildcard_constraints:
 	id = r"[^/.]+"
 
@@ -68,7 +52,8 @@ rule all:
 		expand(os.path.join(REMOVE_DIR, "{id}.layout"), id=ACCESSIONS), # make sure fastq files are deleted
 		expand(os.path.join(OVERHANG_DIR, "{id}.tar.gz"), id=ACCESSIONS), # filtering, extracting, and archiving overhangs
 		expand(os.path.join(CDHIT_DIR, "{id}.tar.gz"), id=ACCESSIONS), # cd-hit clustering + archiving
-		expand(os.path.join(GENE_DISRUPTION_DIR, "{id}.zip"), id=ACCESSIONS) # BLAST clusters against masked ref genomes, classify gene disruptions
+		expand(os.path.join(GENE_DISRUPTION_DIR, "{id}.zip"), id=ACCESSIONS), # BLAST clusters against masked ref genomes, classify gene disruptions
+		expand(os.path.join(PAIRED_DIR, "{id}.zip"), id=ACCESSIONS) # pair up left/right overhang clusters at the same junction
 
 rule prefetch:
 	group: "align_is"
@@ -132,13 +117,13 @@ rule bwa_isfinder:
 		layout=os.path.join(FASTQ_DIR, "{id}.layout")
 	output:
 		bam=os.path.join(BAM_DIR, "{id}.bam")
-	log: 
+	log:
 		"logs/bwa_isfinder/{id}.log"
 	resources:
 		runtime="5m",
 		mem="500M"
 	conda: "/home/hua575/baymlab/sibmi/conda-envs/minibwa.yaml"
-	params: 
+	params:
 		fastq_dir=FASTQ_DIR
 	shell:
 		"""
@@ -169,18 +154,18 @@ rule bwa_isfinder:
 
 rule remove_fastqs:
 	group: "align_is"
-	input: 
+	input:
 		os.path.join(BAM_DIR, "{id}.bam"),
 		layout=os.path.join(FASTQ_DIR, "{id}.layout")
 	output:
 		removed=os.path.join(REMOVE_DIR, "{id}.layout")
-	log: 
-		"logs/remove_fastqs/{id}.log"	
+	log:
+		"logs/remove_fastqs/{id}.log"
 	resources:
 		runtime="1m",
 		mem="100M"
 	conda: "/home/hua575/baymlab/sibmi/conda-envs/minibwa.yaml"
-	params: 
+	params:
 		fastq_dir=FASTQ_DIR
 	shell:
 		"""
@@ -209,19 +194,10 @@ rule remove_fastqs:
 		"""
 
 
-# clip_overhangs and cd_hit used to be separate rules, each writing dozens of
-# small per-IS-element files straight to /n/scratch, with a third pair of rules
-# archiving them afterward. Since clip_overhangs runs much faster than cd_hit
-# can consume its output, that left a large, unbounded "clipped but not yet
-# clustered" backlog of small raw files sitting on the quota-limited
-# filesystem at all times -- which is what blew the inode quota on 2026-07-22.
-#
-# Merged into one rule: all per-IS-element intermediates (raw overhang fastas,
-# raw cd-hit cluster files) now live only in the job's local $TMPDIR, which
-# never touches /n/scratch's inode quota and disappears when the job ends.
-# Only the small manifest/reads.tsv results and one combined tar.gz per stage
-# get written to persistent storage, per accession, atomically -- so there's
-# no window where a large number of small files can accumulate on scratch.
+# clip_overhangs + cd-hit are merged into one rule so per-IS-element
+# intermediates never touch /n/scratch's inode quota: everything lives in the
+# job's local $TMPDIR, and only the small manifests/reads.tsv plus one
+# tar.gz per stage get persisted to scratch.
 rule clip_and_cluster:
 	group: "overhangs"
 	input:
@@ -289,27 +265,18 @@ rule clip_and_cluster:
 		"""
 
 
-
-# BLASTs each accession's cluster representative sequences (produced by
-# clip_and_cluster's reads.tsv) against the combined masked-ref-genome BLAST
-# db, and classifies whether each cluster's IS-insertion junction actually
-# disrupted a gene. See scripts/blast_clusters_to_ref.py's module docstring
-# for the full classification logic.
-#
-# --tmp_dir gets its own {wildcards.id}-and-$$-scoped subdir under the job's
-# $TMPDIR (same idiom as clip_and_cluster's WORK dir above) so the
-# intermediate BLAST query FASTA this script writes never collides with
-# another {id}'s job writing into the same shared GENE_DISRUPTION_DIR at the
-# same time -- only each job's own final {id}.zip lands in the shared dir.
+# BLASTs each accession's cluster representative sequences against the masked
+# ref-genome BLAST db (BLASTDB/GBFF_SUFFIX above) and classifies whether each
+# cluster's IS-insertion junction disrupted a gene (see
+# scripts/blast_clusters_to_ref.py's module docstring for the full
+# classification logic).
 rule blast_clusters_to_ref:
 	group: "gene_disruption"
 	input:
 		reads_tsv=os.path.join(CDHIT_DIR, "{id}", "{id}.reads.tsv"),
 		script=os.path.join(SCRIPT_DIR, "scripts", "blast_clusters_to_ref.py"),
 		blastdb_file=BLASTDB + ".nsq",
-		ref_gbffs=expand(
-			os.path.join(REF_GENOMES_DIR, "{acc}", "{acc}_no_IS.gbff"), acc=REF_ACCESSIONS
-		)
+		ref_gbffs=REF_GBFFS
 	output:
 		os.path.join(GENE_DISRUPTION_DIR, "{id}.zip")
 	log:
@@ -318,12 +285,10 @@ rule blast_clusters_to_ref:
 		runtime="10m",
 		mem="1G"
 	# group-components bundles 10 of these into one SLURM submission (see
-	# slurmprofile/config.yaml); threads sum across the group for that one
-	# sbatch call, so keep this at 1 -- 10 components * 1 thread = 10 cores
-	# per submission, matching the explicit "max 10 cores/job" budget (also
-	# well under the short partition's 20-CPU/job cap that a higher value
-	# blew past on 2026-07-23). blastn on this small combined db is fast
-	# enough single-threaded that this isn't a meaningful runtime cost.
+	# slurmprofile/config.yaml), summing threads across the group, so this
+	# stays at 1 (10 components x 1 thread = 10 cores/submission, under the
+	# short partition's 20-CPU/job cap -- blastn on this small db is fast
+	# enough single-threaded that this isn't a meaningful runtime cost).
 	threads: 1
 	shell:
 		"""
@@ -339,201 +304,31 @@ rule blast_clusters_to_ref:
 			--blastdb {BLASTDB} \
 			--ref_genomes_dir {REF_GENOMES_DIR} \
 			--accessions {REF_ACCESSIONS_STR} \
+			--gbff_suffix {GBFF_SUFFIX} \
 			--output_dir {GENE_DISRUPTION_DIR} \
 			--tmp_dir "$TMP_DIR" \
 			--threads {threads}
 		"""
 
 
-# same as blast_clusters_to_ref, but against the v2 (ISfinder-BLAST-masked)
-# reference genomes -- kept as a separate rule/output dir rather than
-# replacing blast_clusters_to_ref so v1 and v2 results can be compared
-# side-by-side. Not wired into `rule all`; run by targeting
-# GENE_DISRUPTION_DIR_V2/{id}.zip explicitly.
-rule blast_clusters_to_ref_v2:
-	group: "gene_disruption"
+# Adds a "pairing" column to every IS-element TSV inside a blast_clusters_to_ref
+# zip, matching up left/right overhang clusters that land at the same
+# insertion junction (see pairing/add_pairing_column.py's module docstring).
+rule add_pairing_column:
 	input:
-		reads_tsv=os.path.join(CDHIT_DIR, "{id}", "{id}.reads.tsv"),
-		script=os.path.join(SCRIPT_DIR, "scripts", "blast_clusters_to_ref.py"),
-		blastdb_file=BLASTDB_V2 + ".nsq",
-		ref_gbffs=expand(
-			os.path.join(REF_GENOMES_DIR, "{acc}", "{acc}_no_IS_v2.gbff"), acc=REF_ACCESSIONS
-		)
+		zip=os.path.join(GENE_DISRUPTION_DIR, "{id}.zip"),
+		script=os.path.join(SCRIPT_DIR, "pairing", "add_pairing_column.py")
 	output:
-		os.path.join(GENE_DISRUPTION_DIR_V2, "{id}.zip")
+		os.path.join(PAIRED_DIR, "{id}.zip")
 	log:
-		"logs/blast_clusters_to_ref_v2/{id}.log"
+		"logs/add_pairing_column/{id}.log"
 	resources:
-		runtime="10m",
-		mem="1G"
-	threads: 1
+		runtime="2m",
+		mem="200M"
 	shell:
 		"""
 		set -euo pipefail
 		exec > {log} 2>&1
 
-		TMP_DIR={resources.tmpdir}/blast_clusters_to_ref_v2.{wildcards.id}.$$
-		mkdir -p "$TMP_DIR"
-		trap 'rm -rf "$TMP_DIR"' EXIT
-
-		/home/hua575/miniconda3/envs/bakta/bin/python {input.script} \
-			--cdhit_dirs {CDHIT_DIR}/{wildcards.id} \
-			--blastdb {BLASTDB_V2} \
-			--ref_genomes_dir {REF_GENOMES_DIR} \
-			--accessions {REF_ACCESSIONS_STR} \
-			--gbff_suffix no_IS_v2 \
-			--output_dir {GENE_DISRUPTION_DIR_V2} \
-			--tmp_dir "$TMP_DIR" \
-			--threads {threads}
+		/home/hua575/miniconda3/envs/minibwa/bin/python {input.script} --zip {input.zip} --out-dir {PAIRED_DIR}
 		"""
-
-
-# convenience aggregate target for the v2 rerun -- not wired into `rule all`.
-# Target this rule name directly (with --allowed-rules blast_clusters_to_ref_v2
-# gene_disruption_v2_all) rather than expanding {id}.zip paths on the command
-# line: 148k+ paths blows past the shell's argv size limit.
-#
-# id set: reuses the v1 GENE_DISRUPTION_DIR's already-written {id}.zip names as
-# a fast proxy for "has a cd-hit reads.tsv" (a v1 zip could only have been
-# written if clip_and_cluster's reads.tsv existed for that id) -- a flat
-# listing of ~148k files is a single readdir, versus a glob descending into
-# ~148k per-id cd-hit subdirectories, which is slow enough on this filesystem
-# to make DAG-building itself take minutes (confirmed empirically 2026-08-03:
-# checking every id's CDHIT_DIR reads.tsv one-by-one during DAG build alone
-# took ~2 min before even reaching the one id that's actually missing it).
-_v1_gene_disruption_ids = {
-	f[:-len(".zip")] for f in os.listdir(GENE_DISRUPTION_DIR) if f.endswith(".zip")
-} if os.path.isdir(GENE_DISRUPTION_DIR) else set()
-GENE_DISRUPTION_V2_IDS = [id for id in ACCESSIONS if id in _v1_gene_disruption_ids]
-
-rule gene_disruption_v2_all:
-	input:
-		expand(os.path.join(GENE_DISRUPTION_DIR_V2, "{id}.zip"), id=GENE_DISRUPTION_V2_IDS)
-
-
-### ismapper #########################################################################
-
-# rule ismapper:
-#     group: "mapping"
-#     input:
-#         layout=os.path.join(FASTQ_DIR, "{id}.layout"),
-#         ref="ismapper/ncbi_dataset/data/GCF_000005845.2/genomic.gbff",
-#         is_query="ISfinder_database-master/IS.database.fa"
-#     output:
-#         outdir=directory(os.path.join(PATH, "ismapper", "{id}"))
-#     log:
-#         "logs/ismapper/log/{id}.log"
-#     resources:
-#         runtime="2h",
-#         mem="4G"
-#     conda: "/home/hua575/baymlab/sibmi/conda-envs/ismapper.yaml"
-#     params:
-#         fastq_dir=FASTQ_DIR
-#     shell:
-#         """
-#         LAYOUT=$(cat {input.layout})
-
-#         if [ "$LAYOUT" = "paired" ]; then
-#             R1={params.fastq_dir}/{wildcards.id}_1.fastq
-#             R2={params.fastq_dir}/{wildcards.id}_2.fastq
-
-#             if [ ! -f "$R1" ] || [ ! -f "$R2" ]; then
-#                 echo "ERROR: paired layout declared but R1/R2 not found" >> {log}
-#                 exit 1
-#             fi
-
-#             ismap \
-#                 --reads "$R1" "$R2" \
-#                 --queries {input.is_query} \
-#                 --reference {input.ref} \
-#                 --output_dir {output.outdir} \
-# 				--log {wildcard.id} \
-#                 >> {log} 2>&1
-
-#         elif [ "$LAYOUT" = "single" ]; then
-#             R1={params.fastq_dir}/{wildcards.id}.fastq
-
-#             if [ ! -f "$R1" ]; then
-#                 echo "ERROR: single layout declared but reads not found" >> {log}
-#                 exit 1
-#             fi
-
-#             ismap \
-#                 --reads "$R1" \
-#                 --queries {input.is_query} \
-#                 --reference {input.ref} \
-#                 --output_dir {output.outdir} \
-# 				--log {wildcard.id} \
-#                 >> {log} 2>&1
-
-#         else
-#             echo "ERROR: unrecognized layout '$LAYOUT'" >> {log}
-#             exit 1
-#         fi
-#         """
-
-
-
-### chunking #################################################
-
-# import os, glob
-
-# CHUNK_DIR = "/n/scratch/users/h/hua575/chunks500"
-# PATH = "/n/scratch/users/h/hua575/v2"
-# FASTQ_DIR = os.path.join(PATH, "fastq-files-v2")
-
-# CHUNKS = [os.path.splitext(os.path.basename(f))[0]
-# 	for f in glob.glob(os.path.join(CHUNK_DIR, "chunk_*.txt"))][:1]
-
-# rule all:
-# 	input:
-# 		expand(os.path.join(CHUNK_DIR, "{chunk}.done"), chunk=CHUNKS)
-
-# rule process_chunk:
-# 	input:
-# 		os.path.join(CHUNK_DIR, "{chunk}.txt")
-# 	output:
-# 		os.path.join(CHUNK_DIR, "{chunk}.done")
-# 	log: "logs/{chunk}.log"
-# 	resources:
-# 		runtime="12h",
-# 		mem="500MB"
-# 	conda: "/home/hua575/baymlab/sibmi/conda-envs/ncbi-datasets.yaml"
-# 	shell:
-# 		"""
-# 		set +e
-# 		while IFS= read -r id; do
-
-# 			# prefetch: skip if .sra already exists
-# 			if [ -f {PATH}/$id/$id.sra ]; then
-# 				echo "[$(date)] SKIP prefetch $id (already exists)" >> {log}
-# 			else
-# 				echo "[$(date)] prefetch $id" >> {log}
-# 				prefetch "$id" --output-directory {PATH} 2>> {log}
-# 				if [ $? -ne 0 ]; then
-# 					echo "[$(date)] ERROR: prefetch failed for $id" >> {log}
-# 					continue
-# 				fi
-# 			fi
-
-# 			# fasterq: skip if layout already exists
-# 			if [ -f {FASTQ_DIR}/${{id}}.layout ]; then
-# 				echo "[$(date)] SKIP fasterq $id (already exists)" >> {log}
-# 			else
-# 				echo "[$(date)] fasterq $id" >> {log}
-# 				fasterq-dump {PATH}/$id/$id.sra --outdir {FASTQ_DIR} 2>> {log}
-# 				if [ $? -ne 0 ]; then
-# 					echo "[$(date)] ERROR: fasterq failed for $id" >> {log}
-# 					continue
-# 				fi
-
-# 				if [ -f {FASTQ_DIR}/${{id}}_1.fastq ]; then
-# 					echo "paired" > {FASTQ_DIR}/${{id}}.layout
-# 				else
-# 					echo "single" > {FASTQ_DIR}/${{id}}.layout
-# 				fi
-# 			fi
-
-# 		done < {input}
-# 		touch {output}
-# 		"""
