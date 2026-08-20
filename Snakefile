@@ -203,7 +203,7 @@ rule clip_and_cluster:
 	input:
 		bam=os.path.join(BAM_DIR, "{id}.bam"),
 		overhang_script=os.path.join(SCRIPT_DIR, "scripts", "overhangs.py"),
-		combine_script=os.path.join(SCRIPT_DIR, "scripts", "combine_cdhit_clusters.py")
+		cluster_script=os.path.join(SCRIPT_DIR, "scripts", "cluster_overhangs_edlib.py")
 	output:
 		overhang_manifest=os.path.join(OVERHANG_DIR, "{id}", "{id}.manifest.tsv"),
 		overhang_archive=os.path.join(OVERHANG_DIR, "{id}.tar.gz"),
@@ -230,24 +230,27 @@ rule clip_and_cluster:
 		/home/hua575/miniconda3/envs/minibwa/bin/python {input.overhang_script} \
 			{input.bam} "$OVERHANG_WORK" --sample_id {wildcards.id} --skip_is_hit_filter
 
-		# stage 2: cluster each is_element/side pair with cd-hit-est (cd-hit env)
-		printf 'is_element\tside\tn_in\tcentroids_path\tclstr_path\n' > "$CDHIT_WORK/{wildcards.id}.cdhit_manifest.tsv"
-		tail -n +2 "$OVERHANG_WORK/{wildcards.id}.manifest.tsv" | while IFS=$'\t' read -r is_element side n_seqs fasta_path; do
-			[ -z "$fasta_path" ] && continue
-			out="$CDHIT_WORK/{wildcards.id}__${{is_element}}__${{side}}.cdhit"
-			/home/hua575/miniconda3/envs/cd-hit/bin/cd-hit-est -i "$fasta_path" -o "$out" \
-				-c 0.9 -n 8 -G 0 -aS 0.8 -d 0 -M 0 -T {threads}
-			printf '%s\t%s\t%s\t%s\t%s\n' \
-				"$is_element" "$side" "$n_seqs" "$out" "$out.clstr" >> "$CDHIT_WORK/{wildcards.id}.cdhit_manifest.tsv"
-		done
+		# stage 2: cluster each is_element/side pair with a position-anchored edit
+		# distance (edlib SHW/prefix mode) instead of CD-HIT's percent-identity +
+		# coverage-threshold approach -- see cluster_overhangs_edlib.py's module
+		# docstring for the anchoring/algorithm rationale. One script call replaces
+		# both the cd-hit-est loop and the combine_cdhit_clusters.py step.
+		#
+		# TODO(infra): `edlib` (pip install edlib, pure C++ ext, no Rust toolchain)
+		# is not yet installed in the bakta env -- add it there before this rule
+		# will run (bakta already has pandas, needed here too, so reusing it avoids
+		# a new env). Update the interpreter path below if a different env is used.
+		/home/hua575/miniconda3/envs/bakta/bin/python {input.cluster_script} \
+			"$OVERHANG_WORK/{wildcards.id}.manifest.tsv" \
+			--sample_id {wildcards.id} \
+			--output_dir "$CDHIT_WORK" \
+			--max_edit_frac 0.10 --merge_edit_frac 0.15 --min_cluster_size 2
 
-		/home/hua575/miniconda3/envs/cd-hit/bin/python {input.combine_script} "$CDHIT_WORK" --output_dir "$CDHIT_WORK"
-
-		# persist only the small, useful results. centroids_path/clstr_path in the
-		# saved manifest are rewritten from the (about-to-be-deleted) tmpdir to the
-		# conventional persistent-style path -- valid only after extracting
-		# cd-hit/{wildcards.id}.tar.gz there, but self-documenting rather than
-		# pointing at a tmpdir that no longer exists once this job ends.
+		# persist only the small, useful results. cluster_overhangs_edlib.py's
+		# manifest (is_element/side/n_in/n_clusters) carries no tmpdir-relative
+		# paths, so the sed below is a no-op pass-through today -- kept so this
+		# still self-documents/rewrites correctly if a future manifest column ever
+		# does reference $CDHIT_WORK-relative paths again.
 		mkdir -p "{OVERHANG_DIR}/{wildcards.id}" "{CDHIT_DIR}/{wildcards.id}"
 		cp "$OVERHANG_WORK/{wildcards.id}.manifest.tsv" {output.overhang_manifest}
 		sed "s|$CDHIT_WORK/|{CDHIT_DIR}/{wildcards.id}/|g" \
