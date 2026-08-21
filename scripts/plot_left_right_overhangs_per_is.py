@@ -7,7 +7,6 @@
 #   python plot_left_right_overhangs_per_is.py atb/ecoli_atb_sra_accessions_random10.txt
 
 import argparse
-import tarfile
 from pathlib import Path
 
 import pandas as pd
@@ -15,7 +14,7 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
-DEFAULT_CDHIT_ROOT = Path("/n/scratch/users/h/hua575/atb_filtered/cd-hit")
+DEFAULT_CLUSTER_ROOT = Path("/n/scratch/users/h/hua575/atb_filtered/clusters")
 DEFAULT_OUTPUT_DIR = Path("/home/hua575/baymlab/mapping/atb/downstream_analysis/left_right_overhang_plots/all")
 
 
@@ -23,59 +22,21 @@ def read_accessions(path: Path) -> list:
     return [line.strip() for line in path.read_text().splitlines() if line.strip()]
 
 
-def open_archive_index(cdhit_root: Path, accession: str):
-    """
-    Once cd_hit output is archived (scripts/archive_output_dir.sh), the raw
-    per-IS .cdhit/.clstr files are deleted from {cdhit_root}/{accession}/ and
-    only live inside {cdhit_root}/{accession}.tar.gz. Open that archive once
-    per accession and index it by basename so individual members can be
-    pulled without extracting the whole thing to disk.
-    """
-    tar_path = cdhit_root / f"{accession}.tar.gz"
-    if not tar_path.exists():
-        return None
-    tf = tarfile.open(tar_path, "r:gz")
-    index = {Path(m.name).name: m for m in tf.getmembers() if m.isfile()}
-    return tf, index
+def collect_counts(accessions: list, cluster_root: Path) -> pd.DataFrame:
+    """One row per (accession, is_element, side, n_clusters).
 
-
-def count_fasta_records(fasta_path: Path, archive) -> int:
-    # a .cdhit fasta has one record per cluster representative, so this is the
-    # deduplicated overhang count for that (sample, is_element, side) --
-    # including singleton clusters, same metric as reads.ipynb cell 40
-    if fasta_path.exists():
-        with open(fasta_path) as f:
-            return sum(1 for line in f if line.startswith(">"))
-    if archive is None:
-        raise FileNotFoundError(
-            f"{fasta_path} missing on disk and no {fasta_path.parent.name}.tar.gz archive found")
-    tf, index = archive
-    member = index.get(fasta_path.name)
-    if member is None:
-        raise FileNotFoundError(f"{fasta_path.name} missing on disk and not found in archive")
-    with tf.extractfile(member) as fh:
-        return sum(1 for line in fh if line.startswith(b">"))
-
-
-def collect_counts(accessions: list, cdhit_root: Path) -> pd.DataFrame:
-    """One row per (accession, is_element, side, n_clusters)."""
+    n_clusters comes straight from each accession's {accession}.cluster_manifest.tsv
+    -- cluster_overhangs_edlib.py already writes this column directly (no need
+    to open per-group fasta files/archives and count representative records
+    the way this used to work against CD-HIT's .cdhit centroid fastas, which
+    the current clustering method doesn't produce)."""
     rows = []
     for accession in accessions:
-        manifest_path = cdhit_root / accession / f"{accession}.cdhit_manifest.tsv"
+        manifest_path = cluster_root / accession / f"{accession}.cluster_manifest.tsv"
         if not manifest_path.exists():
-            print(f"WARNING: no cdhit_manifest.tsv for {accession}, skipping")
+            print(f"WARNING: no cluster_manifest.tsv for {accession}, skipping")
             continue
         manifest = pd.read_csv(manifest_path, sep="\t")
-
-        archive = open_archive_index(cdhit_root, accession)
-        try:
-            manifest["n_clusters"] = manifest["centroids_path"].apply(
-                lambda p: count_fasta_records(Path(p), archive)
-            )
-        finally:
-            if archive is not None:
-                archive[0].close()
-
         manifest["accession"] = accession
         rows.append(manifest[["accession", "is_element", "side", "n_clusters"]])
 
@@ -125,16 +86,16 @@ def main() -> None:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("accessions_file", type=Path,
                     help="file of genome accessions, one per line")
-    p.add_argument("--cdhit-root", type=Path, default=DEFAULT_CDHIT_ROOT,
-                    help=f"root dir containing {{accession}}/{{accession}}.cdhit_manifest.tsv "
-                         f"(default: {DEFAULT_CDHIT_ROOT})")
+    p.add_argument("--cluster-root", type=Path, default=DEFAULT_CLUSTER_ROOT,
+                    help=f"root dir containing {{accession}}/{{accession}}.cluster_manifest.tsv "
+                         f"(default: {DEFAULT_CLUSTER_ROOT})")
     p.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR,
                     help=f"where to write {{is_element}}.png plots "
                          f"(default: {DEFAULT_OUTPUT_DIR})")
     args = p.parse_args()
 
     accessions = read_accessions(args.accessions_file)
-    counts = collect_counts(accessions, args.cdhit_root)
+    counts = collect_counts(accessions, args.cluster_root)
 
     per_genome = (
         counts

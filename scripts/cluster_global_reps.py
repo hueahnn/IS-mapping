@@ -1,15 +1,20 @@
 # purpose: pool every accession's non-singleton cluster representative
-# sequences (each accession's {accession}.reads.tsv, produced by
-# combine_cdhit_clusters.py inside rule clip_and_cluster) across ALL IS
-# elements and ALL genomes, split only by side (left/right) -- not by
-# is_element -- then re-cluster each pooled side with cd-hit-est using the
-# same parameters rule clip_and_cluster uses per-sample. This collapses the
-# same flanking sequence recurring across many genomes/IS elements into one
-# global cluster, so downstream analysis can count how many distinct genes are
-# actually being hit and how many times each one is disrupted.
+# sequences (each accession's {accession}.reads.tsv, produced by rule
+# clip_and_cluster's per-sample clustering step) across ALL IS elements and
+# ALL genomes, split only by side (left/right) -- not by is_element -- then
+# re-cluster each pooled side with cd-hit-est. This global re-clustering step
+# is independent of whichever method rule clip_and_cluster used per-sample
+# (cluster_overhangs_edlib.py or the older CD-HIT-based path both produce the
+# same reads.tsv contract this pools from) -- it always uses cd-hit-est itself
+# at the global level, so the CDHIT_ARGS below are no longer guaranteed to
+# match the per-sample method's thresholds the way they did when both stages
+# used CD-HIT. This collapses the same flanking sequence recurring across many
+# genomes/IS elements into one global cluster, so downstream analysis can
+# count how many distinct genes are actually being hit and how many times each
+# one is disrupted.
 #
 # reads.tsv already drops singleton clusters (a read that didn't match
-# anything else within its own genome) -- see combine_cdhit_clusters.py -- so
+# anything else within its own genome) -- see rule clip_and_cluster -- so
 # every representative sequence pooled here already represents a cluster of
 # >=2 reads within its own genome. Singletons are not reconsidered at the
 # global level.
@@ -36,15 +41,16 @@ import pandas as pd
 
 CD_HIT_EST_BIN = "/home/hua575/miniconda3/envs/cd-hit/bin/cd-hit-est"
 
-# same clustering parameters rule clip_and_cluster uses in
-# /home/hua575/baymlab/mapping/Snakefile, so the global re-clustering stays
-# directly comparable to the per-sample clustering it's pooling from
+# the parameters rule clip_and_cluster's OLD CD-HIT-based path used to use in
+# /home/hua575/baymlab/mapping/Snakefile -- kept as this global step's own
+# default since it still clusters with cd-hit-est regardless of which method
+# produced the per-sample reads.tsv it's pooling from
 CDHIT_ARGS = ["-c", "0.9", "-n", "8", "-G", "0", "-aS", "0.8", "-d", "0", "-M", "0"]
 
 SIDES = ["left", "right"]
 
 
-def pool_representative_seqs(cdhit_dir: Path, output_dir: Path) -> dict:
+def pool_representative_seqs(cluster_dir: Path, output_dir: Path) -> dict:
     """
     Stream every accession's {accession}.reads.tsv into two pooled FASTAs, one
     per side, pooling clusters across every is_element and every accession.
@@ -55,7 +61,7 @@ def pool_representative_seqs(cdhit_dir: Path, output_dir: Path) -> dict:
     pooled_paths = {side: output_dir / f"pooled_{side}.fasta" for side in SIDES}
     handles = {side: open(path, "w") for side, path in pooled_paths.items()}
 
-    accession_dirs = sorted(d for d in cdhit_dir.iterdir() if d.is_dir())
+    accession_dirs = sorted(d for d in cluster_dir.iterdir() if d.is_dir())
     n_clusters = {side: 0 for side in SIDES}
     try:
         for i, acc_dir in enumerate(accession_dirs, 1):
@@ -101,15 +107,15 @@ def run_cdhit_est(fasta_path: Path, output_dir: Path, side: str, threads: int) -
 
 def main():
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("--cdhit_dir", type=Path,
-                    default=Path("/n/scratch/users/h/hua575/atb_filtered/cd-hit"),
-                    help="per-accession cd-hit output dir "
+    p.add_argument("--cluster_dir", type=Path,
+                    default=Path("/n/scratch/users/h/hua575/atb_filtered/clusters"),
+                    help="per-accession overhang-clustering output dir "
                          "(contains {accession}/{accession}.reads.tsv)")
     p.add_argument("--output_dir", type=Path,
                     default=Path("/n/scratch/users/h/hua575/atb_filtered/global_cdhit"),
                     help="where to write pooled_{side}.fasta and "
                          "global_{side}.cdhit(.clstr) "
-                         "(default: atb_filtered/global_cdhit, alongside cd-hit/)")
+                         "(default: atb_filtered/global_cdhit, alongside clusters/)")
     p.add_argument("--threads", type=int, default=16,
                     help="passed to cd-hit-est -T")
     p.add_argument("--skip_pooling", action="store_true",
@@ -124,7 +130,7 @@ def main():
             sys.exit(f"--skip_pooling but missing pooled fasta(s): {missing}")
     else:
         t0 = time.time()
-        pooled_paths = pool_representative_seqs(args.cdhit_dir, args.output_dir)
+        pooled_paths = pool_representative_seqs(args.cluster_dir, args.output_dir)
         print(f"pooling took {time.time() - t0:.0f}s", file=sys.stderr)
 
     for side in SIDES:

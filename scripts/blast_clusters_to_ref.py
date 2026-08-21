@@ -1,7 +1,9 @@
-# purpose: BLAST cd-hit cluster representative sequences (overhang clusters from
-# scripts/overhangs.py + scripts/combine_cdhit_clusters.py) against the
-# masked (IS-excised) E. coli reference genomes, and determine whether the
-# IS-element insertion each overhang came from actually DISRUPTED a gene.
+# purpose: BLAST overhang-cluster representative sequences (overhang clusters
+# from scripts/overhangs.py, clustered by either scripts/cluster_overhangs_edlib.py
+# or the older scripts/combine_cdhit_clusters.py -- both produce the same
+# reads.tsv contract this script consumes) against the masked (IS-excised)
+# E. coli reference genomes, and determine whether the IS-element insertion
+# each overhang came from actually DISRUPTED a gene.
 #
 # An overhang read has two ends, and only one is biologically meaningful for
 # that question: the end immediately adjacent to the real IS-insertion
@@ -18,10 +20,10 @@
 # follows the clip in the read); for side=="right" the FIRST base is
 # junction-adjacent (the aligned portion precedes the clip). This holds
 # regardless of read mapping strand, since pysam already normalizes
-# query_sequence/cigartuples to reference-forward order before that script
-# ever slices anything, and cd-hit-est never revcomps a cluster's stored
-# representative sequence either -- so this orientation survives untouched
-# into the BLAST query here.
+# query_sequence/cigartuples to reference-forward order before overhangs.py
+# ever slices anything, and neither clustering script (cd-hit-est nor
+# cluster_overhangs_edlib.py) revcomps a cluster's stored representative
+# sequence -- so this orientation survives untouched into the BLAST query here.
 #
 # In BLAST tabular output, qstart<=qend always, and sstart<->qstart /
 # send<->qend positionally correspond regardless of subject strand (verified
@@ -29,11 +31,12 @@
 # for side=="left" the junction-adjacent genomic position is `send`; for
 # side=="right" it's `sstart`.
 #
-# input: one or more {sample}.cd-hit output directories, each already containing
-# {sample}__{is_element}__{side}.reads.tsv files (combine_cdhit_clusters.py output).
-# A "cluster" here is the unit (sample, is_element, side, cluster_id); singleton
-# clusters never appear in reads.tsv (combine_cdhit_clusters.py drops them), so
-# every cluster this script sees has >= 2 member reads.
+# input: one or more {sample} overhang-clustering output directories, each
+# already containing a {sample}.reads.tsv file (cluster_overhangs_edlib.py or
+# combine_cdhit_clusters.py output -- same column contract either way). A
+# "cluster" here is the unit (sample, is_element, side, cluster_id); singleton
+# clusters never appear in reads.tsv (both scripts drop them), so every
+# cluster this script sees has >= 2 member reads.
 #
 # output: one long-format TSV, one row per (cluster, ref_genome) hit that passed
 # the identity/coverage thresholds, plus one row per cluster with no passing hit
@@ -51,7 +54,7 @@
 #
 # usage:
 #   python blast_clusters_to_ref.py \
-#       --cdhit_dirs /n/scratch/.../cd-hit/SRR8275060 /n/scratch/.../cd-hit/SRR8456430 ... \
+#       --cluster_dirs /n/scratch/.../clusters/SRR8275060 /n/scratch/.../clusters/SRR8456430 ... \
 #       --blastdb /home/hua575/baymlab/mapping/ref_genomes/blastdb/ecoli_masked_combined \
 #       --ref_genomes_dir /home/hua575/baymlab/mapping/ref_genomes/ecoli \
 #       --output clusters_blasted.tsv
@@ -93,14 +96,14 @@ JUNCTION_TOLERANCE_BP = 0
 # 1. gather cluster representatives from combine_cdhit_clusters.py's reads.tsv
 # ---------------------------------------------------------------------------
 
-def gather_cluster_reps(cdhit_dirs: list[Path]) -> pd.DataFrame:
+def gather_cluster_reps(cluster_dirs: list[Path]) -> pd.DataFrame:
     """
     One row per (sample, is_element, side, cluster_id): its representative
     sequence and how many member reads it has.
     """
     rows = []
-    for cdhit_dir in cdhit_dirs:
-        for reads_tsv in sorted(cdhit_dir.glob("*.reads.tsv")):
+    for cluster_dir in cluster_dirs:
+        for reads_tsv in sorted(cluster_dir.glob("*.reads.tsv")):
             df = pd.read_csv(reads_tsv, sep="\t", dtype={"pos": str})
             if df.empty:
                 continue
@@ -412,8 +415,8 @@ def write_split_tables(final: pd.DataFrame, output_dir: Path) -> None:
 
 def main():
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("--cdhit_dirs", nargs="+", required=True,
-                    help="one or more {sample}'s cd-hit output dirs (containing *.reads.tsv)")
+    p.add_argument("--cluster_dirs", nargs="+", required=True,
+                    help="one or more {sample}'s overhang-clustering output dirs (containing *.reads.tsv)")
     p.add_argument("--blastdb", required=True,
                     help="path prefix of the combined masked-genome BLAST db")
     p.add_argument("--ref_genomes_dir", required=True,
@@ -437,13 +440,13 @@ def main():
     p.add_argument("--threads", type=int, default=8)
     args = p.parse_args()
 
-    cdhit_dirs = [Path(d) for d in args.cdhit_dirs]
+    cluster_dirs = [Path(d) for d in args.cluster_dirs]
     ref_genomes_dir = Path(args.ref_genomes_dir)
     output_dir = Path(args.output_dir)
     tmp_dir = Path(args.tmp_dir) if args.tmp_dir else output_dir
 
     print("Gathering cluster representatives...")
-    clusters = gather_cluster_reps(cdhit_dirs)
+    clusters = gather_cluster_reps(cluster_dirs)
     print(f"  {len(clusters)} clusters across {clusters['sample'].nunique() if len(clusters) else 0} samples")
 
     if clusters.empty:

@@ -20,7 +20,7 @@ FASTQ_DIR = os.path.join(PATH, "fastq-files")                     # fasterq, bwa
 BAM_DIR = os.path.join(PATH, "bam-files")                         # bwa_isfinder, clip_and_cluster
 REMOVE_DIR = os.path.join(PATH, "removed")                        # remove_fastqs
 OVERHANG_DIR = os.path.join(PATH, "overhangs")                    # clip_and_cluster
-CDHIT_DIR = os.path.join(PATH, "cd-hit")                          # clip_and_cluster, blast_clusters_to_ref
+CLUSTER_DIR = os.path.join(PATH, "clusters")                      # clip_and_cluster, blast_clusters_to_ref
 GENE_DISRUPTION_DIR = os.path.join(PATH, "gene_disruption")       # blast_clusters_to_ref
 PAIRED_DIR = os.path.join(PATH, "gene_disruption_paired")         # add_pairing_column
 
@@ -51,7 +51,7 @@ rule all:
 		expand(os.path.join(BAM_DIR, "{id}.bam"), id=ACCESSIONS), # make sure bam file is generated
 		expand(os.path.join(REMOVE_DIR, "{id}.layout"), id=ACCESSIONS), # make sure fastq files are deleted
 		expand(os.path.join(OVERHANG_DIR, "{id}.tar.gz"), id=ACCESSIONS), # filtering, extracting, and archiving overhangs
-		expand(os.path.join(CDHIT_DIR, "{id}.tar.gz"), id=ACCESSIONS), # cd-hit clustering + archiving
+		expand(os.path.join(CLUSTER_DIR, "{id}.tar.gz"), id=ACCESSIONS), # overhang clustering + archiving
 		expand(os.path.join(GENE_DISRUPTION_DIR, "{id}.zip"), id=ACCESSIONS), # BLAST clusters against masked ref genomes, classify gene disruptions
 		expand(os.path.join(PAIRED_DIR, "{id}.zip"), id=ACCESSIONS) # pair up left/right overhang clusters at the same junction
 
@@ -194,7 +194,7 @@ rule remove_fastqs:
 		"""
 
 
-# clip_overhangs + cd-hit are merged into one rule so per-IS-element
+# clip_overhangs + clustering are merged into one rule so per-IS-element
 # intermediates never touch /n/scratch's inode quota: everything lives in the
 # job's local $TMPDIR, and only the small manifests/reads.tsv plus one
 # tar.gz per stage get persisted to scratch.
@@ -207,9 +207,9 @@ rule clip_and_cluster:
 	output:
 		overhang_manifest=os.path.join(OVERHANG_DIR, "{id}", "{id}.manifest.tsv"),
 		overhang_archive=os.path.join(OVERHANG_DIR, "{id}.tar.gz"),
-		cdhit_manifest=os.path.join(CDHIT_DIR, "{id}", "{id}.cdhit_manifest.tsv"),
-		reads_tsv=os.path.join(CDHIT_DIR, "{id}", "{id}.reads.tsv"),
-		cdhit_archive=os.path.join(CDHIT_DIR, "{id}.tar.gz")
+		cluster_manifest=os.path.join(CLUSTER_DIR, "{id}", "{id}.cluster_manifest.tsv"),
+		reads_tsv=os.path.join(CLUSTER_DIR, "{id}", "{id}.reads.tsv"),
+		cluster_archive=os.path.join(CLUSTER_DIR, "{id}.tar.gz")
 	log:
 		"logs/clip_and_cluster/{id}.log"
 	resources:
@@ -222,8 +222,8 @@ rule clip_and_cluster:
 
 		WORK={resources.tmpdir}/clip_and_cluster.{wildcards.id}.$$
 		OVERHANG_WORK="$WORK/overhangs"
-		CDHIT_WORK="$WORK/cdhit"
-		mkdir -p "$OVERHANG_WORK" "$CDHIT_WORK"
+		CLUSTER_WORK="$WORK/clusters"
+		mkdir -p "$OVERHANG_WORK" "$CLUSTER_WORK"
 		trap 'rm -rf "$WORK"' EXIT
 
 		# stage 1: clip overhangs from the bam (needs pysam/samtools -- minibwa env)
@@ -234,7 +234,7 @@ rule clip_and_cluster:
 		# distance (edlib SHW/prefix mode) instead of CD-HIT's percent-identity +
 		# coverage-threshold approach -- see cluster_overhangs_edlib.py's module
 		# docstring for the anchoring/algorithm rationale. One script call replaces
-		# both the cd-hit-est loop and the combine_cdhit_clusters.py step.
+		# both the old cd-hit-est loop and the old combine_cdhit_clusters.py step.
 		#
 		# TODO(infra): `edlib` (pip install edlib, pure C++ ext, no Rust toolchain)
 		# is not yet installed in the bakta env -- add it there before this rule
@@ -243,28 +243,28 @@ rule clip_and_cluster:
 		/home/hua575/miniconda3/envs/bakta/bin/python {input.cluster_script} \
 			"$OVERHANG_WORK/{wildcards.id}.manifest.tsv" \
 			--sample_id {wildcards.id} \
-			--output_dir "$CDHIT_WORK" \
+			--output_dir "$CLUSTER_WORK" \
 			--max_edit_frac 0.10 --merge_edit_frac 0.15 --min_cluster_size 2
 
 		# persist only the small, useful results. cluster_overhangs_edlib.py's
 		# manifest (is_element/side/n_in/n_clusters) carries no tmpdir-relative
 		# paths, so the sed below is a no-op pass-through today -- kept so this
 		# still self-documents/rewrites correctly if a future manifest column ever
-		# does reference $CDHIT_WORK-relative paths again.
-		mkdir -p "{OVERHANG_DIR}/{wildcards.id}" "{CDHIT_DIR}/{wildcards.id}"
+		# does reference $CLUSTER_WORK-relative paths again.
+		mkdir -p "{OVERHANG_DIR}/{wildcards.id}" "{CLUSTER_DIR}/{wildcards.id}"
 		cp "$OVERHANG_WORK/{wildcards.id}.manifest.tsv" {output.overhang_manifest}
-		sed "s|$CDHIT_WORK/|{CDHIT_DIR}/{wildcards.id}/|g" \
-			"$CDHIT_WORK/{wildcards.id}.cdhit_manifest.tsv" > {output.cdhit_manifest}
-		cp "$CDHIT_WORK/{wildcards.id}.reads.tsv" {output.reads_tsv}
+		sed "s|$CLUSTER_WORK/|{CLUSTER_DIR}/{wildcards.id}/|g" \
+			"$CLUSTER_WORK/{wildcards.id}.cluster_manifest.tsv" > {output.cluster_manifest}
+		cp "$CLUSTER_WORK/{wildcards.id}.reads.tsv" {output.reads_tsv}
 
 		# archive the raw intermediates -- built once, verified, then moved into place
 		tar -C "$OVERHANG_WORK" -czf {output.overhang_archive}.tmp .
 		tar -tzf {output.overhang_archive}.tmp > /dev/null
 		mv {output.overhang_archive}.tmp {output.overhang_archive}
 
-		tar -C "$CDHIT_WORK" -czf {output.cdhit_archive}.tmp .
-		tar -tzf {output.cdhit_archive}.tmp > /dev/null
-		mv {output.cdhit_archive}.tmp {output.cdhit_archive}
+		tar -C "$CLUSTER_WORK" -czf {output.cluster_archive}.tmp .
+		tar -tzf {output.cluster_archive}.tmp > /dev/null
+		mv {output.cluster_archive}.tmp {output.cluster_archive}
 		"""
 
 
@@ -276,7 +276,7 @@ rule clip_and_cluster:
 rule blast_clusters_to_ref:
 	group: "gene_disruption"
 	input:
-		reads_tsv=os.path.join(CDHIT_DIR, "{id}", "{id}.reads.tsv"),
+		reads_tsv=os.path.join(CLUSTER_DIR, "{id}", "{id}.reads.tsv"),
 		script=os.path.join(SCRIPT_DIR, "scripts", "blast_clusters_to_ref.py"),
 		blastdb_file=BLASTDB + ".nsq",
 		ref_gbffs=REF_GBFFS
@@ -303,7 +303,7 @@ rule blast_clusters_to_ref:
 		trap 'rm -rf "$TMP_DIR"' EXIT
 
 		/home/hua575/miniconda3/envs/bakta/bin/python {input.script} \
-			--cdhit_dirs {CDHIT_DIR}/{wildcards.id} \
+			--cluster_dirs {CLUSTER_DIR}/{wildcards.id} \
 			--blastdb {BLASTDB} \
 			--ref_genomes_dir {REF_GENOMES_DIR} \
 			--accessions {REF_ACCESSIONS_STR} \
