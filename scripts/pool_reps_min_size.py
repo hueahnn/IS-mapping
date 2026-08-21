@@ -1,18 +1,18 @@
 # purpose: pool representative sequences for every (is_element, side,
-# cluster_id) cluster across ALL accessions in the per-accession cd-hit
-# directory (/n/scratch/users/h/hua575/atb_filtered/cd-hit/{accession}/
-# {accession}.reads.tsv, produced by combine_cdhit_clusters.py) into a single
-# merged fasta, keeping only clusters whose size (number of member reads) is
-# >= --min_size. Unlike cluster_global_reps.py this does NOT re-run cd-hit or
-# split by side -- it just filters and merges the existing per-accession
-# cluster representatives directly.
+# cluster_id) cluster across ALL accessions in the per-accession overhang-
+# clustering directory (/n/scratch/users/h/hua575/atb_filtered/clusters/
+# {accession}/{accession}.reads.tsv, produced by rule clip_and_cluster) into a
+# single merged fasta, keeping only clusters whose size (number of member
+# reads) is >= --min_size. Unlike cluster_global_reps.py this does NOT re-run
+# cd-hit or split by side -- it just filters and merges the existing
+# per-accession cluster representatives directly.
 #
 # usage (single chunk):
 #   python pool_reps_min_size.py --accession-list chunk.txt --min_size 10 \
 #       --out chunk_out.fasta
 #
 # usage (all accessions, no chunking -- only for small test runs):
-#   python pool_reps_min_size.py --cdhit_dir /n/scratch/users/h/hua575/atb_filtered/cd-hit \
+#   python pool_reps_min_size.py --cluster_dir /n/scratch/users/h/hua575/atb_filtered/clusters \
 #       --min_size 10 --out merged.fasta
 
 import argparse
@@ -48,7 +48,7 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__)
     grp = ap.add_mutually_exclusive_group(required=True)
     grp.add_argument("--accession-list", help="file with one accession dir path per line")
-    grp.add_argument("--cdhit_dir", type=Path, help="process every accession dir found directly under this dir")
+    grp.add_argument("--cluster_dir", type=Path, help="process every accession dir found directly under this dir")
     ap.add_argument("--min_size", type=int, default=10, help="minimum cluster size, inclusive (default 10)")
     ap.add_argument("--out", required=True, help="output fasta path")
     args = ap.parse_args()
@@ -57,7 +57,7 @@ def main():
         with open(args.accession_list) as fh:
             acc_dirs = [Path(line.strip()) for line in fh if line.strip()]
     else:
-        acc_dirs = sorted(d for d in args.cdhit_dir.iterdir() if d.is_dir())
+        acc_dirs = sorted(d for d in args.cluster_dir.iterdir() if d.is_dir())
 
     total_written = 0
     with open(args.out, "w") as out_fh:

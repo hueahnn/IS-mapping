@@ -210,7 +210,7 @@ def cluster_sample(manifest_path: Path, output_dir: Path, sample_id: str,
     print(f"-> {reads_path} ({len(reads_df)} total reads)")
 
     manifest_df = pd.DataFrame(manifest_rows, columns=["is_element", "side", "n_in", "n_clusters"])
-    manifest_out_path = output_dir / f"{sample_id}.cdhit_manifest.tsv"
+    manifest_out_path = output_dir / f"{sample_id}.cluster_manifest.tsv"
     manifest_df.to_csv(manifest_out_path, sep="\t", index=False)
 
 
@@ -221,7 +221,7 @@ if __name__ == "__main__":
                          "overhangs/{sample}/{sample}.manifest.tsv (overhangs.py output)")
     p.add_argument("--sample_id", required=True)
     p.add_argument("--output_dir", required=True,
-                    help="where to write {sample}.reads.tsv and {sample}.cdhit_manifest.tsv")
+                    help="where to write {sample}.reads.tsv and {sample}.cluster_manifest.tsv")
     p.add_argument("--max_edit_frac", type=float, default=0.10,
                     help="max allowed edits as a fraction of the shorter (query) "
                          "sequence's length, for the primary clustering pass")

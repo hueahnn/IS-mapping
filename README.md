@@ -20,7 +20,8 @@ snakemake --profile slurmprofile --rerun-incomplete --use-conda --executor slurm
 ```
 
 `Snakefile` chains together: `prefetch` → `fasterq` → `bwa_isfinder` → `remove_fastqs`
-→ `clip_and_cluster` (overhang extraction + cd-hit clustering) → `blast_clusters_to_ref`
+→ `clip_and_cluster` (overhang extraction + position-anchored edit-distance clustering,
+see `scripts/cluster_overhangs_edlib.py`) → `blast_clusters_to_ref`
 (gene-disruption classification) → `add_pairing_column` (left/right junction pairing).
 It runs against `atb/ecoli_atb_sra_accessions.txt` by default (override with
 `--config input_path=...`).
@@ -40,7 +41,8 @@ Scripts invoked by the Snakefile, plus downstream analysis run standalone.
 | file | purpose |
 |---|---|
 | `overhangs.py` | 4-stage filter (coverage → per-read quality → per-IS-element hit count → FASTA extraction) that pulls soft-clipped overhang reads out of a BAM. Used by the `clip_and_cluster` rule. |
-| `combine_cdhit_clusters.py` | Merges one sample's cd-hit cluster + representative-sequence output into a single `reads.tsv`, dropping singleton clusters. Used by `clip_and_cluster`. |
+| `cluster_overhangs_edlib.py` | Clusters one sample's overhangs per (is_element, side) using a position-anchored edit distance (edlib SHW/prefix mode) instead of CD-HIT, writing `reads.tsv` directly. Used by `clip_and_cluster`. |
+| `combine_cdhit_clusters.py` | Merges one sample's cd-hit cluster + representative-sequence output into a single `reads.tsv`, dropping singleton clusters. No longer used by `clip_and_cluster` (superseded by `cluster_overhangs_edlib.py`); kept for the still-CD-HIT-based `cluster_and_align_by_is.py`. |
 | `blast_clusters_to_ref.py` | BLASTs cluster representatives against the masked reference genomes and classifies gene disruption at the insertion junction. Used by the `blast_clusters_to_ref` rule. |
 | `masking.py` | Builds the masked reference genomes: BLASTs each *E. coli* reference against ISfinder and excises matching regions from both FASTA and GBFF. |
 | `cluster_global_reps.py` | Pools every accession's cluster representatives (by side, across all IS elements) and re-clusters at the global level. |
