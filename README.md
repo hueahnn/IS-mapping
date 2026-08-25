@@ -111,9 +111,17 @@ the HMS O2 cluster but aren't checked in:
 
 ## To Dos for the Future
 
+- **Output every passing BLAST hit, not just the top one, per (cluster, ref_genome).**
+  `blast_clusters_to_ref.py`'s `best_hit_per_genome()` currently sorts by bitscore and
+  keeps only the single best hit per `(qseqid, ref_genome)`, silently dropping any
+  other hit that also clears the thresholds — which is exactly what hides
+  repeated/duplicated-gene ambiguity (see the MAPQ to-do below). Add a minimum-bitscore
+  threshold alongside the existing `MIN_PIDENT`/`MIN_QCOV` filters, and keep every hit
+  that passes all three instead of collapsing to one, so downstream analysis can see
+  and reason about multiple candidate placements for the same overhang.
 - **Use MAPQ for repeated genes.** When mapping overhang clusters to the reference
-  genome, gene repetitions cause ambiguous placement — use MAPQ score to handle this.
-  See ISMapper figure 2.
+  genome, gene repetitions cause ambiguous placement — use MAPQ score to handle this
+  (needs the multi-hit output above first). See ISMapper figure 2.
 - **Aggregate the output data.** Current output format is hard to parse. Look into
   concatenating across accessions without producing absurdly large files, and
   cross-referencing the cluster info, original reads/overhang info, and gene hits
