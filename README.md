@@ -123,7 +123,7 @@ the HMS O2 cluster but aren't checked in:
   just the current 6.
 - **Add the ISfinder database FASTA to the repo.** The IS-element reference used for
   alignment/masking (`ISfinder_database-master_2026/IS.database.collapsed99.fa`)
-  currently only lives on O2 — check it into GitHub so the exact reference the
+  currently only lives on O2 — add it to GitHub so the exact reference the
   pipeline runs against is version-controlled and reproducible outside the cluster.
 - **Biological follow-ups to look into:**
   - Megaplate data has a region mediated by transposons that causes a duplication.
