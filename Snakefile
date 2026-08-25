@@ -147,8 +147,13 @@ rule bwa_isfinder:
 			fi
 		done
 
+		# no -q MAPQ filter here on purpose: low-MAPQ reads still need to reach
+		# overhangs.py, which routes them to a separate "ambiguous" FASTA
+		# (--min_mapq, default 30) instead of dropping them -- filtering them out
+		# here would discard MAPQ 0-19 reads before overhangs.py ever sees them,
+		# rather than preserving them for later use as intended.
 		minibwa map isfinder $READS 2> {log} | \
-		samtools view -b -F 0x904 -q 20 - | \
+		samtools view -b -F 0x904 - | \
 		samtools sort -o {output.bam} 2>> {log}
 		"""
 
