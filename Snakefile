@@ -95,25 +95,9 @@ rule fasterq:
 		fi
 		"""
 
-# for separating single vs paired ends
-def get_fastqs(wildcards):
-	layout_file = checkpoints.fasterq.get(id=wildcards.id).output.layout
-	with open(layout_file) as f:
-		layout = f.read().strip()
-	if layout == "paired":
-		return [
-			os.path.join(FASTQ_DIR, f"{wildcards.id}_1.fastq"),
-			os.path.join(FASTQ_DIR, f"{wildcards.id}_2.fastq"),
-	]
-	elif layout == "single":
-		return [os.path.join(FASTQ_DIR, f"{wildcards.id}.fastq")]
-	else:
-		raise ValueError(f"Unrecognized layout '{layout}' for {wildcards.id}")
-
 rule bwa_isfinder:
 	group: "align_is"
 	input:
-		# fastqs=get_fastqs,
 		layout=os.path.join(FASTQ_DIR, "{id}.layout")
 	output:
 		bam=os.path.join(BAM_DIR, "{id}.bam")

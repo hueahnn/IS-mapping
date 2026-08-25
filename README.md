@@ -125,6 +125,14 @@ the HMS O2 cluster but aren't checked in:
   alignment/masking (`ISfinder_database-master_2026/IS.database.collapsed99.fa`)
   currently only lives on O2 — add it to GitHub so the exact reference the
   pipeline runs against is version-controlled and reproducible outside the cluster.
+- **Decide how to handle single vs. paired-end reads beyond alignment.** Single-vs-
+  paired status only matters for `fasterq`/`bwa_isfinder`/`remove_fastqs` (how many
+  fastqs to hand `minibwa`, which files to delete). After that, every mate of a
+  paired-end read is treated as fully independent evidence — nothing uses mate
+  orientation, insert size, or requires both mates to support the same junction.
+  Worth deciding whether pairing should factor in as a corroborating signal,
+  especially for disambiguating low-confidence placements (ties into the MAPQ
+  to-do above).
 - **Biological follow-ups to look into:**
   - Megaplate data has a region mediated by transposons that causes a duplication.
   - Cluster size correlates with coverage, which gives info about duplications.
