@@ -93,6 +93,57 @@ JUNCTION_TOLERANCE_BP = 0
 
 
 # ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# 0. estimated sequencing coverage, for the coverage_fraction column
+#
+# coverage_fraction = n_seqs / est_coverage, where
+#     est_coverage = total_bases / genome_size
+#
+# i.e. how much read support a cluster has relative to how deeply the sample
+# was sequenced. It approximates the fraction of the population carrying that
+# insertion -- ~1 means fixed in the sample, well under 1 means a
+# subpopulation. Treat it as a strong relative measure rather than a calibrated
+# allele frequency: a junction only yields an overhang when a read overlaps it
+# by at least overhangs.py's --min_clip_len, so the expected value for a fixed
+# insertion sits slightly below 1 rather than exactly at it.
+#
+# total_bases is summed straight off the FASTQs by the Snakefile's read_stats
+# rule, which has to run before remove_fastqs deletes them -- it is not
+# recoverable later, since the BAM holds only IS-mapped reads. Summing bases
+# rather than multiplying n_reads by a nominal read length is the same quantity
+# by definition and stays exact when reads are variable-length after trimming.
+#
+# genome_size is the per-sample ATB assembly length (see
+# scripts/build_genome_size_table.py for why a fixed E. coli constant is not
+# good enough). Both inputs are optional: without them the two columns are
+# still written, but empty, so the output schema does not depend on them.
+# ---------------------------------------------------------------------------
+
+def load_est_coverage(read_stats_paths, genome_sizes_path) -> dict:
+    """sample -> est_coverage (total_bases / genome_size), for samples where
+    both numbers are known."""
+    if not read_stats_paths or not genome_sizes_path:
+        return {}
+
+    sizes = {}
+    gs = pd.read_csv(genome_sizes_path, sep="\t", dtype={"run_accession": str})
+    for run, size in zip(gs["run_accession"], gs["genome_size"]):
+        if pd.notna(run) and pd.notna(size) and float(size) > 0:
+            sizes[str(run)] = float(size)
+
+    est = {}
+    for path in read_stats_paths:
+        df = pd.read_csv(path, sep="\t", dtype={"sample": str})
+        for sample, total_bases in zip(df["sample"], df["total_bases"]):
+            sample = str(sample)
+            genome_size = sizes.get(sample)
+            if genome_size is None or pd.isna(total_bases):
+                continue
+            est[sample] = float(total_bases) / genome_size
+    return est
+
+
+# ---------------------------------------------------------------------------
 # 1. gather cluster representatives from combine_cdhit_clusters.py's reads.tsv
 # ---------------------------------------------------------------------------
 
@@ -302,7 +353,9 @@ def best_hit_per_genome(blast_df: pd.DataFrame) -> pd.DataFrame:
 # 4. assemble final long-format table
 # ---------------------------------------------------------------------------
 
-def assemble_table(clusters: pd.DataFrame, hits: pd.DataFrame, intervals: dict) -> pd.DataFrame:
+def assemble_table(clusters: pd.DataFrame, hits: pd.DataFrame, intervals: dict,
+                    est_coverage_by_sample: dict | None = None) -> pd.DataFrame:
+    est_coverage_by_sample = est_coverage_by_sample or {}
     hits_by_query = {k: v for k, v in hits.groupby("qseqid")}
 
     rows = []
@@ -317,6 +370,14 @@ def assemble_table(clusters: pd.DataFrame, hits: pd.DataFrame, intervals: dict) 
             "query_length": len(cl["rep_seq"]),
             "n_seqs": cl["n_seqs"],
         }
+
+        # left empty (not zero) when the sample has no read-stats/genome-size
+        # entry -- an unknown denominator must not read as "no support"
+        est_cov = est_coverage_by_sample.get(cl["sample"])
+        base["est_coverage"] = round(est_cov, 4) if est_cov else None
+        base["coverage_fraction"] = (
+            round(cl["n_seqs"] / est_cov, 6) if est_cov else None
+        )
 
         cluster_hits = hits_by_query.get(key)
         if cluster_hits is None or cluster_hits.empty:
@@ -365,7 +426,7 @@ def assemble_table(clusters: pd.DataFrame, hits: pd.DataFrame, intervals: dict) 
     column_order = [
         "sample", "is_element", "side", "cluster_id",
         "hit_type", "gene", "gene_rank",
-        "rep_seq", "query_length", "n_seqs",
+        "rep_seq", "query_length", "n_seqs", "est_coverage", "coverage_fraction",
         "ref_genome", "contig", "junction_pos", "hit_start", "hit_end", "hit_strand",
         "pident", "evalue",
     ]
@@ -437,6 +498,14 @@ def main():
                          "(not shared --output_dir) when multiple invocations of this script run "
                          "concurrently against the same --output_dir -- otherwise their query "
                          "FASTAs collide on the same filename.")
+    p.add_argument("--read_stats", nargs="*", default=None,
+                    help="per-sample read-stats TSVs (sample/n_reads/total_bases/"
+                         "mean_read_length) from the Snakefile's read_stats rule. With "
+                         "--genome_sizes, enables the est_coverage and coverage_fraction "
+                         "columns; omit both and those columns are written empty.")
+    p.add_argument("--genome_sizes", default=None,
+                    help="run_accession -> genome_size TSV from "
+                         "scripts/build_genome_size_table.py")
     p.add_argument("--threads", type=int, default=8)
     args = p.parse_args()
 
@@ -467,8 +536,15 @@ def main():
     print("Loading CDS intervals from masked gbff files...")
     intervals = load_cds_intervals(ref_genomes_dir, args.accessions, gbff_suffix=args.gbff_suffix)
 
+    est_coverage = load_est_coverage(args.read_stats, args.genome_sizes)
+    if est_coverage:
+        print(f"  estimated coverage known for {len(est_coverage)} sample(s)")
+    elif args.read_stats or args.genome_sizes:
+        print("  WARNING: coverage inputs given but no sample matched -- "
+              "est_coverage/coverage_fraction will be empty")
+
     print("Classifying hits and assembling final table...")
-    final = assemble_table(clusters, hits, intervals)
+    final = assemble_table(clusters, hits, intervals, est_coverage)
     write_split_tables(final, output_dir)
 
 

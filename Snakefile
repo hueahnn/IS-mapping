@@ -19,6 +19,7 @@ PATH = "/n/scratch/users/h/hua575/atb_filtered"
 FASTQ_DIR = os.path.join(PATH, "fastq-files")                     # fasterq, bwa_isfinder, remove_fastqs
 BAM_DIR = os.path.join(PATH, "bam-files")                         # bwa_isfinder, clip_and_cluster
 REMOVE_DIR = os.path.join(PATH, "removed")                        # remove_fastqs
+READ_STATS_DIR = os.path.join(PATH, "read_stats")                 # read_stats, blast_clusters_to_ref
 OVERHANG_DIR = os.path.join(PATH, "overhangs")                    # clip_and_cluster
 CLUSTER_DIR = os.path.join(PATH, "clusters")                      # clip_and_cluster, blast_clusters_to_ref
 GENE_DISRUPTION_DIR = os.path.join(PATH, "gene_disruption")       # blast_clusters_to_ref
@@ -26,6 +27,12 @@ PAIRED_DIR = os.path.join(PATH, "gene_disruption_paired")         # add_pairing_
 
 SCRIPT_DIR = "/n/data1/hms/dbmi/baym/hue/mapping"                   # clip_and_cluster, blast_clusters_to_ref, add_pairing_column
 IS_DB = "ISfinder_database-master_2026/IS.database.collapsed99.fa" # bwa_isfinder
+
+# run_accession -> assembled genome length, for blast_clusters_to_ref's
+# est_coverage denominator. Built once by scripts/build_genome_size_table.py
+# from atb/ecoli_atb_filtered.csv; see that script for why the per-sample size
+# is used rather than a fixed E. coli constant.
+GENOME_SIZES = os.path.join(SCRIPT_DIR, "atb", "genome_size_table.tsv")
 
 # reference genomes / BLAST db for blast_clusters_to_ref (masking.py's
 # ISfinder-BLAST-based excision -- see scripts/masking.py)
@@ -50,6 +57,7 @@ rule all:
 	input:
 		expand(os.path.join(BAM_DIR, "{id}.bam"), id=ACCESSIONS), # make sure bam file is generated
 		expand(os.path.join(REMOVE_DIR, "{id}.layout"), id=ACCESSIONS), # make sure fastq files are deleted
+		expand(os.path.join(READ_STATS_DIR, "{id}.tsv"), id=ACCESSIONS), # read/base counts, captured before the fastqs go
 		expand(os.path.join(OVERHANG_DIR, "{id}.tar.gz"), id=ACCESSIONS), # filtering, extracting, and archiving overhangs
 		expand(os.path.join(CLUSTER_DIR, "{id}.tar.gz"), id=ACCESSIONS), # overhang clustering + archiving
 		expand(os.path.join(GENE_DISRUPTION_DIR, "{id}.zip"), id=ACCESSIONS), # BLAST clusters against masked ref genomes, classify gene disruptions
@@ -141,10 +149,63 @@ rule bwa_isfinder:
 		samtools sort -o {output.bam} 2>> {log}
 		"""
 
+# Total reads/bases per sample, summed straight off the fastqs. This HAS to run
+# before remove_fastqs deletes them and cannot be recovered afterwards: the bam
+# holds only reads that mapped to an IS element (-F 0x904 off `minibwa map
+# isfinder`), so it carries no record of the library's total size. Feeds
+# blast_clusters_to_ref's est_coverage/coverage_fraction columns.
+rule read_stats:
+	group: "align_is"
+	input:
+		layout=os.path.join(FASTQ_DIR, "{id}.layout")
+	output:
+		stats=os.path.join(READ_STATS_DIR, "{id}.tsv")
+	log:
+		"logs/read_stats/{id}.log"
+	resources:
+		runtime="5m",
+		mem="100M"
+	params:
+		fastq_dir=FASTQ_DIR
+	shell:
+		"""
+		set -euo pipefail
+
+		LAYOUT=$(cat {input.layout})
+
+		if [ "$LAYOUT" = "paired" ]; then
+			READS="{params.fastq_dir}/{wildcards.id}_1.fastq {params.fastq_dir}/{wildcards.id}_2.fastq"
+		elif [ "$LAYOUT" = "single" ]; then
+			READS="{params.fastq_dir}/{wildcards.id}.fastq"
+		else
+			echo "ERROR: unrecognized layout '$LAYOUT'" >> {log}
+			exit 1
+		fi
+
+		for f in $READS; do
+			if [ ! -f "$f" ]; then
+				echo "ERROR: expected read file missing: $f" >> {log}
+				exit 1
+			fi
+		done
+
+		mkdir -p "$(dirname {output.stats})"
+
+		# FNR (not NR) so the every-4th-line sequence stride restarts per file,
+		# which keeps this correct for the paired case regardless of the two
+		# mates' line counts.
+		awk 'FNR % 4 == 2 {{ n++; b += length($0) }}
+		     END {{ printf "sample\tn_reads\ttotal_bases\tmean_read_length\n{wildcards.id}\t%d\t%d\t%.2f\n", n, b, (n ? b / n : 0) }}' \
+		    $READS > {output.stats}.tmp 2>> {log}
+		mv {output.stats}.tmp {output.stats}
+		"""
+
 rule remove_fastqs:
 	group: "align_is"
 	input:
 		os.path.join(BAM_DIR, "{id}.bam"),
+		# ordering edge: the stats must be summed while the fastqs still exist
+		stats=os.path.join(READ_STATS_DIR, "{id}.tsv"),
 		layout=os.path.join(FASTQ_DIR, "{id}.layout")
 	output:
 		removed=os.path.join(REMOVE_DIR, "{id}.layout")
@@ -268,6 +329,8 @@ rule blast_clusters_to_ref:
 		reads_tsv=os.path.join(CLUSTER_DIR, "{id}", "{id}.reads.tsv"),
 		script=os.path.join(SCRIPT_DIR, "scripts", "blast_clusters_to_ref.py"),
 		blastdb_file=BLASTDB + ".nsq",
+		read_stats=os.path.join(READ_STATS_DIR, "{id}.tsv"),
+		genome_sizes=GENOME_SIZES,
 		ref_gbffs=REF_GBFFS
 	output:
 		os.path.join(GENE_DISRUPTION_DIR, "{id}.zip")
@@ -299,7 +362,9 @@ rule blast_clusters_to_ref:
 			--gbff_suffix {GBFF_SUFFIX} \
 			--output_dir {GENE_DISRUPTION_DIR} \
 			--tmp_dir "$TMP_DIR" \
-			--threads {threads}
+			--threads {threads} \
+			--read_stats {input.read_stats} \
+			--genome_sizes {input.genome_sizes}
 		"""
 
 
