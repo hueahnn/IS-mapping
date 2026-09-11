@@ -119,9 +119,24 @@ the HMS O2 cluster but aren't checked in:
   threshold alongside the existing `MIN_PIDENT`/`MIN_QCOV` filters, and keep every hit
   that passes all three instead of collapsing to one, so downstream analysis can see
   and reason about multiple candidate placements for the same overhang.
-- **Use MAPQ for repeated genes.** When mapping overhang clusters to the reference
-  genome, gene repetitions cause ambiguous placement — use MAPQ score to handle this
-  (needs the multi-hit output above first). See ISMapper figure 2.
+- **Resolve ambiguous placement in repeated reference regions.** When an overhang
+  cluster's representative matches several copies of a repeat, its placement is
+  ambiguous, and a left/right pair can be split across two different copies so the
+  insertion never pairs. ISMapper's figure 2 handles the analogous case by anchoring on
+  the flank that passed its read-depth cutoff and re-searching for a sub-threshold
+  partner near it (`closestBed` of the depth-filtered flank against the *unfiltered*
+  opposite side — see `create_bed_files` / `check_unpaired_hits` in the ISMapper
+  source), stamping everything rescued that way with a `?` confidence suffix. Its exact
+  failure mode does not apply here: ISMapper loses depth because bwa scatters
+  multi-mapping reads across repeat copies, whereas this pipeline clusters overhangs by
+  *sequence* before placing them, so a cluster stays intact and full-depth however
+  repetitive the locus. The remedy still adapts — let the confident partner choose which
+  repeat copy the ambiguous flank is assigned to, and record that the pairing rather
+  than the alignment made that call. Blocked on the multi-hit output above:
+  `best_hit_per_genome()` discards the alternative copies before
+  `pairing/add_pairing_column.py` ever sees them. Note MAPQ is not the lever here — the
+  placement is a BLAST hit, not a bwa alignment — a bitscore-ratio window over the
+  retained candidates is.
 - **Aggregate the output data.** Current output format is hard to parse. Look into
   concatenating across accessions without producing absurdly large files, and
   cross-referencing the cluster info, original reads/overhang info, and gene hits
