@@ -7,12 +7,26 @@ pairing/add_pairing_column.py pipeline.
 
 Definition of "one insertion event": within a given (sample, is_element),
 each (side, cluster_id) is a node. A row's `pairing` value (when not "none")
-links that row's (side, cluster_id) to the opposite side's cluster with that
-id -- both sides are two pieces of evidence for the SAME physical
-transposition junction. Connected components over that graph = distinct
-insertion events for that (sample, is_element). This avoids double-counting
-a single event once per side, and avoids double-counting across the 6
-reference genomes a cluster's flanking sequence happens to BLAST-hit.
+links that row's (side, cluster_id) to its partner cluster -- both sides are
+two pieces of evidence for the SAME physical transposition junction.
+Connected components over that graph = distinct insertion events for that
+(sample, is_element). This avoids double-counting a single event once per
+side, and avoids double-counting across the 6 reference genomes a cluster's
+flanking sequence happens to BLAST-hit.
+
+The `pairing` value is "{is_element}:{side}:{cluster_id}". Zips written before
+add_pairing_column.py grew two-tier pairing instead hold a bare cluster_id;
+those only ever paired within one IS element, so the bare form is read as a
+partner on the opposite side of this same element, and both formats are
+accepted here.
+
+CAVEAT -- cross-IS pairs. A `pairing_type == "cross_is"` row's partner lives
+in a different {is_element}.tsv, so no node for it exists in this file and
+this counter leaves it a singleton. One physical insertion whose two flanks
+were filed under two IS names therefore still counts once under each. Fixing
+that means counting per-zip with is_element in the node key and deciding which
+element the merged event belongs to -- deliberately not done here, since the
+per-is_element tally is the point of this script.
 
 Usage:
     python count_is_events.py --zip-dir DIR --out-csv OUT.csv [--workers N] [--limit N]
@@ -56,6 +70,10 @@ def count_events_in_tsv_text(text):
         pairing_i = header.index("pairing")
     except ValueError:
         return 0
+    # only needed to tell a same-IS partner from a cross-IS one; absent in
+    # tables that predate the column, in which case every partner label is
+    # taken at face value
+    is_i = header.index("is_element") if "is_element" in header else None
 
     nodes = set()
     parent = {}
@@ -75,8 +93,18 @@ def count_events_in_tsv_text(text):
             parent[node] = node
 
         if pairing and pairing != "none":
-            other_side = "right" if side == "left" else "left"
-            other_node = (other_side, pairing)
+            if ":" in pairing:
+                partner_is, partner_side, partner_cid = pairing.split(":", 2)
+                # a cross-IS partner is in another file entirely -- skip the
+                # edge rather than inventing a node for it, which would leave
+                # the real opposite-side node stranded and inflate the count
+                if is_i is not None and partner_is != fields[is_i]:
+                    continue
+                other_node = (partner_side, partner_cid)
+            else:
+                # legacy bare-cluster_id form: same element, opposite side
+                other_side = "right" if side == "left" else "left"
+                other_node = (other_side, pairing)
             if other_node not in nodes:
                 nodes.add(other_node)
                 parent[other_node] = other_node

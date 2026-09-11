@@ -62,7 +62,7 @@ from blast_clusters_to_ref import (
 )
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "pairing"))
-from add_pairing_column import DEFAULT_MAX_GAP, compute_pairing
+from add_pairing_column import DEFAULT_MAX_GAP, NEW_COLUMNS, compute_pairing
 
 CD_HIT_EST_BIN = "/home/hua575/miniconda3/envs/cd-hit/bin/cd-hit-est"
 
@@ -314,9 +314,16 @@ def add_pairing(tsv_path: Path, max_gap: float) -> None:
         fieldnames = list(reader.fieldnames)
         rows = list(reader)
 
-    if "pairing" in fieldnames:
-        fieldnames.remove("pairing")
-    fieldnames.insert(fieldnames.index("cluster_id") + 1, "pairing")
+    # compute_pairing sets every one of NEW_COLUMNS on each row, so all of them
+    # have to be in fieldnames or DictWriter raises on the extra keys. Unlike
+    # add_pairing_column.py's per-IS-element zip members, this table holds
+    # several is_elements at once, so its cross_is rows are load-bearing: they
+    # are how a pair that spans two IS elements is told apart from a same_is one
+    # (before the two-tier split this function paired across is_elements with no
+    # preference and no way to tell which had happened).
+    fieldnames = [f for f in fieldnames if f not in NEW_COLUMNS]
+    at = fieldnames.index("cluster_id") + 1
+    fieldnames[at:at] = NEW_COLUMNS
 
     compute_pairing(rows, max_gap)
 
