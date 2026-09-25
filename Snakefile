@@ -21,7 +21,12 @@ BAM_DIR = os.path.join(PATH, "bam-files")                         # bwa_isfinder
 REMOVE_DIR = os.path.join(PATH, "removed")                        # remove_fastqs
 READ_STATS_DIR = os.path.join(PATH, "read_stats")                 # read_stats, blast_clusters_to_ref
 OVERHANG_DIR = os.path.join(PATH, "overhangs")                    # clip_and_cluster
-CLUSTER_DIR = os.path.join(PATH, "clusters")                      # clip_and_cluster, blast_clusters_to_ref
+CLUSTER_DIR = os.path.join(PATH, "clusters")                      # clip_and_cluster, recruit_ambiguous
+# recruit_ambiguous writes an augmented copy of clusters/{id}/{id}.reads.tsv
+# here, with the ambiguous-MAPQ overhangs folded into the clusters they match.
+# A separate directory because two rules cannot declare the same output file;
+# blast_clusters_to_ref reads from here instead of CLUSTER_DIR.
+RECRUITED_DIR = os.path.join(PATH, "clusters_recruited")          # recruit_ambiguous, blast_clusters_to_ref
 GENE_DISRUPTION_DIR = os.path.join(PATH, "gene_disruption")       # blast_clusters_to_ref
 PAIRED_DIR = os.path.join(PATH, "gene_disruption_paired")         # add_pairing_column
 
@@ -44,6 +49,14 @@ REF_ACCESSIONS = [  # must match the accessions BLASTDB below was built from
 REF_ACCESSIONS_STR = " ".join(REF_ACCESSIONS)  # shell {}-formatting can't eval " ".join(...) inline
 BLASTDB = "/home/hua575/baymlab/mapping/ref_genomes/blastdb/ecoli_masked_combined_v2"
 GBFF_SUFFIX = "no_IS_v2"
+
+# Max bp between a left and right overhang's junction positions for them to count
+# as the same insertion junction. Defined once and passed to BOTH
+# blast_clusters_to_ref (which uses it when deciding WHERE to place each overhang)
+# and add_pairing_column (which uses it to actually pair them). If the two ever
+# disagree, the BLAST step would place overhangs to satisfy a rule the pairing
+# step then rejects.
+MAX_PAIR_GAP = 50
 REF_GBFFS = expand(
 	os.path.join(REF_GENOMES_DIR, "{acc}", "{acc}_" + GBFF_SUFFIX + ".gbff"), acc=REF_ACCESSIONS
 )
@@ -60,6 +73,7 @@ rule all:
 		expand(os.path.join(READ_STATS_DIR, "{id}.tsv"), id=ACCESSIONS), # read/base counts, captured before the fastqs go
 		expand(os.path.join(OVERHANG_DIR, "{id}.tar.gz"), id=ACCESSIONS), # filtering, extracting, and archiving overhangs
 		expand(os.path.join(CLUSTER_DIR, "{id}.tar.gz"), id=ACCESSIONS), # overhang clustering + archiving
+		expand(os.path.join(RECRUITED_DIR, "{id}", "{id}.cluster_coverage.tsv"), id=ACCESSIONS), # per-cluster counts after ambiguous-read recruitment
 		expand(os.path.join(GENE_DISRUPTION_DIR, "{id}.zip"), id=ACCESSIONS), # BLAST clusters against masked ref genomes, classify gene disruptions
 		expand(os.path.join(PAIRED_DIR, "{id}.zip"), id=ACCESSIONS) # pair up left/right overhang clusters at the same junction
 
@@ -318,6 +332,61 @@ rule clip_and_cluster:
 		"""
 
 
+# Recruit the ambiguous-MAPQ overhangs into the clusters built above.
+# clip_and_cluster only clusters the confident left/right buckets; overhangs.py
+# stage 3 holds the low-MAPQ (ZA=1) overhangs back in a per-IS "__ambiguous"
+# FASTA because their left/right call is the unreliable part. Now that
+# representatives exist, each one is re-aligned against the representatives of
+# its IS element (both sides, with reverse-complement handling) and joins the
+# best match -- see scripts/recruit_ambiguous_overhangs.py's module docstring.
+#
+# The output reads.tsv keeps that filename on purpose: blast_clusters_to_ref
+# globs "*.reads.tsv" and already derives n_seqs by counting rows per cluster,
+# so pointing it at RECRUITED_DIR is all that is needed for the corrected
+# cluster coverage to reach the final per-IS tables (and, through n_seqs, the
+# coverage_fraction column).
+rule recruit_ambiguous:
+	group: "overhangs"
+	input:
+		reads_tsv=os.path.join(CLUSTER_DIR, "{id}", "{id}.reads.tsv"),
+		overhang_archive=os.path.join(OVERHANG_DIR, "{id}.tar.gz"),
+		script=os.path.join(SCRIPT_DIR, "scripts", "recruit_ambiguous_overhangs.py")
+	output:
+		reads_tsv=os.path.join(RECRUITED_DIR, "{id}", "{id}.reads.tsv"),
+		coverage=os.path.join(RECRUITED_DIR, "{id}", "{id}.cluster_coverage.tsv")
+	log:
+		"logs/recruit_ambiguous/{id}.log"
+	resources:
+		runtime="5m",
+		mem="500M"
+	shell:
+		"""
+		set -euo pipefail
+		exec > {log} 2>&1
+
+		WORK={resources.tmpdir}/recruit_ambiguous.{wildcards.id}.$$
+		mkdir -p "$WORK"
+		trap 'rm -rf "$WORK"' EXIT
+
+		# the ambiguous FASTAs only exist inside the overhang archive. NOTE the
+		# script globs this directory rather than reading fasta_path out of
+		# {wildcards.id}.manifest.tsv: clip_and_cluster copies that manifest
+		# verbatim from its own $TMPDIR (only the CLUSTER manifest gets
+		# sed-rewritten), so its paths point at a directory that is long gone.
+		tar -xzf {input.overhang_archive} -C "$WORK"
+
+		# an archive with no __ambiguous files is fine and expected for any data
+		# produced before overhangs.py grew the ZA tag -- the script then just
+		# passes the clustered reads through with recruited=0.
+		/home/hua575/miniconda3/envs/bakta/bin/python {input.script} \
+			--reads_tsv {input.reads_tsv} \
+			--overhang_dir "$WORK" \
+			--sample_id {wildcards.id} \
+			--output_dir {RECRUITED_DIR}/{wildcards.id} \
+			--recruit_edit_frac 0.10
+		"""
+
+
 # BLASTs each accession's cluster representative sequences against the masked
 # ref-genome BLAST db (BLASTDB/GBFF_SUFFIX above) and classifies whether each
 # cluster's IS-insertion junction disrupted a gene (see
@@ -326,7 +395,9 @@ rule clip_and_cluster:
 rule blast_clusters_to_ref:
 	group: "gene_disruption"
 	input:
-		reads_tsv=os.path.join(CLUSTER_DIR, "{id}", "{id}.reads.tsv"),
+		# reads from RECRUITED_DIR, not CLUSTER_DIR, so the n_seqs this script
+		# computes includes the recruited ambiguous-MAPQ reads
+		reads_tsv=os.path.join(RECRUITED_DIR, "{id}", "{id}.reads.tsv"),
 		script=os.path.join(SCRIPT_DIR, "scripts", "blast_clusters_to_ref.py"),
 		blastdb_file=BLASTDB + ".nsq",
 		read_stats=os.path.join(READ_STATS_DIR, "{id}.tsv"),
@@ -355,7 +426,7 @@ rule blast_clusters_to_ref:
 		trap 'rm -rf "$TMP_DIR"' EXIT
 
 		/home/hua575/miniconda3/envs/bakta/bin/python {input.script} \
-			--cluster_dirs {CLUSTER_DIR}/{wildcards.id} \
+			--cluster_dirs {RECRUITED_DIR}/{wildcards.id} \
 			--blastdb {BLASTDB} \
 			--ref_genomes_dir {REF_GENOMES_DIR} \
 			--accessions {REF_ACCESSIONS_STR} \
@@ -364,7 +435,8 @@ rule blast_clusters_to_ref:
 			--tmp_dir "$TMP_DIR" \
 			--threads {threads} \
 			--read_stats {input.read_stats} \
-			--genome_sizes {input.genome_sizes}
+			--genome_sizes {input.genome_sizes} \
+			--max_pair_gap {MAX_PAIR_GAP}
 		"""
 
 
@@ -387,5 +459,5 @@ rule add_pairing_column:
 		set -euo pipefail
 		exec > {log} 2>&1
 
-		/home/hua575/miniconda3/envs/minibwa/bin/python {input.script} --zip {input.zip} --out-dir {PAIRED_DIR}
+		/home/hua575/miniconda3/envs/minibwa/bin/python {input.script} --zip {input.zip} --out-dir {PAIRED_DIR} --max-gap {MAX_PAIR_GAP}
 		"""

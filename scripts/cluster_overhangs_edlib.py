@@ -51,13 +51,19 @@ from pathlib import Path
 import edlib
 import pandas as pd
 
+# the trailing mapq field is captured as a named group rather than matched and
+# discarded, so recruit_ambiguous_overhangs.py can record how ambiguous each
+# recruited read was. parse_header() therefore returns an extra "mapq" key
+# (None on pre-ZA headers, which have no mapq field); nothing here consumes it
+# -- reads_rows below is built from explicitly named keys -- so it is inert for
+# clustering.
 # same shape as combine_cdhit_clusters.py's HEADER_RE, but tolerant of the
 # trailing "|mapq:{int}" field the current overhangs.py appends (that regex
 # is anchored with $ right after pident and would fail to match real headers)
 HEADER_RE = re.compile(
     r"^(?P<sample>[^|]+)\|(?P<read_id>[^|]+)\|(?P<is_element>[^|]+)"
     r"\|pos:(?P<pos>[^|]+)\|side:(?P<side>[^|]+)\|strand:(?P<strand>[+-])"
-    r"\|pident:(?P<pident>[\d.]+)(?:\|mapq:\d+)?$"
+    r"\|pident:(?P<pident>[\d.]+)(?:\|mapq:(?P<mapq>\d+))?$"
 )
 
 
@@ -168,6 +174,21 @@ def cluster_sample(manifest_path: Path, output_dir: Path, sample_id: str,
             is_element, side = row["is_element"], row["side"]
             fasta_path = row["fasta_path"]
             if not fasta_path:
+                continue
+
+            # Skip overhangs.py's "ambiguous" bucket instead of clustering it.
+            # This loop used to process every manifest row, which was wrong three
+            # ways: (1) the bucket mixes left- and right-clipped reads, but the
+            # cmp_seq rule below would treat them all as right-side, so the left
+            # ones were compared in the wrong orientation; (2) the resulting
+            # side=="ambiguous" rows reach blast_clusters_to_ref.py, where
+            # compute_junction_position() raises ValueError on any side that is
+            # not left/right; (3) those reads are now recruited into real
+            # clusters by recruit_ambiguous_overhangs.py, so clustering them here
+            # as well would double-count them in every cluster coverage figure.
+            if side not in ("left", "right"):
+                print(f"{is_element} {side}: skipped ({row.get('n_seqs', '?')} reads "
+                      f"held for recruitment)")
                 continue
 
             records = read_fasta(Path(fasta_path))

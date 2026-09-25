@@ -69,6 +69,19 @@ from Bio import SeqIO
 
 BLASTN_BIN = "/home/hua575/miniconda3/envs/blast/bin/blastn"
 
+# Pairing-aware hit selection (see select_hits). MAX_PAIR_GAP must match
+# pairing/add_pairing_column.py's --max-gap, or this script places overhangs to
+# satisfy a pairing rule the pairing step then disagrees with -- the Snakefile
+# defines it once and passes it to both.
+DEFAULT_MAX_PAIR_GAP = 50
+# how many alternative loci per (cluster, genome) stay in play for pairing
+DEFAULT_MAX_CANDIDATES = 10
+# an alternative locus is only considered if its bitscore is at least this
+# fraction of the cluster's best in that genome -- the "balance" knob between
+# alignment quality and pairing proximity. 1.0 keeps only best-scoring hits
+# (plus exact ties), which reproduces the old best-hit-only behaviour.
+DEFAULT_MIN_SCORE_FRAC = 0.90
+
 BLAST_OUTFMT = (
     "6 qseqid sseqid pident length mismatch gapopen "
     "qstart qend sstart send evalue bitscore qlen slen sstrand"
@@ -334,19 +347,149 @@ def run_blast(query_fasta: Path, blastdb: str, threads: int = 8) -> pd.DataFrame
     return df
 
 
-def best_hit_per_genome(blast_df: pd.DataFrame) -> pd.DataFrame:
-    """Split sseqid into (ref_genome, contig), filter by identity/coverage,
-    then keep the single best (by bitscore) hit per (qseqid, ref_genome)."""
+# best_hit_per_genome() used to collapse straight to the single highest-bitscore
+# hit per (cluster, genome). That decision was made with no knowledge of where
+# the partner overhang landed, which breaks down in repetitive regions: the left
+# overhang's best hit can sit on one copy of a repeat and the right overhang's on
+# another, so a real insertion never pairs. It is now split in two -- collect
+# candidate loci, then choose among them jointly. Same ISMapper idea (its
+# `bedtools closest` pairs flanks by proximity rather than by best alignment),
+# adapted to BLAST hits of one representative sequence per cluster.
+# NOTE: the output contract is UNCHANGED -- still at most one row per
+# (qseqid, ref_genome), which assemble_table and the downstream pairing step
+# both depend on.
+
+def candidate_hits_per_genome(blast_df: pd.DataFrame, clusters: pd.DataFrame,
+                               max_candidates: int = DEFAULT_MAX_CANDIDATES,
+                               min_score_frac: float = DEFAULT_MIN_SCORE_FRAC) -> pd.DataFrame:
+    """Split sseqid into (ref_genome, contig), filter by identity/coverage, and
+    keep up to max_candidates plausible loci per (qseqid, ref_genome) instead of
+    only the best one.
+
+    Adds the columns select_hits() needs:
+      side           -- the cluster's left/right, joined from `clusters`
+      junction_pos0  -- 0-indexed junction-adjacent genomic coordinate
+      reach_ok       -- whether the HSP actually reaches that end
+      score_frac     -- bitscore / this cluster's best bitscore in this genome
+
+    Candidates are deduplicated by junction position first: blastn readily emits
+    several overlapping HSPs at one locus, and without this they would consume
+    the max_candidates budget and crowd out the genuinely distinct repeat copy
+    this function exists to keep in play.
+    """
+    empty_cols = ["ref_genome", "contig", "side", "junction_pos0", "reach_ok", "score_frac"]
     if blast_df.empty:
-        return blast_df.assign(ref_genome=[], contig=[])
+        return blast_df.assign(**{c: [] for c in empty_cols})
 
     df = blast_df.copy()
     df[["ref_genome", "contig"]] = df["sseqid"].str.split("__", n=1, expand=True)
     df["qcov"] = df["length"] / df["qlen"]
     df = df[(df["pident"] >= MIN_PIDENT) & (df["qcov"] >= MIN_QCOV)]
-    df = df.sort_values("bitscore", ascending=False)
-    df = df.drop_duplicates(subset=["qseqid", "ref_genome"], keep="first")
-    return df
+
+    side_by_key = dict(zip(clusters["cluster_key"], clusters["side"]))
+    df["side"] = df["qseqid"].map(side_by_key)
+    df = df[df["side"].isin(("left", "right"))]
+    if df.empty:
+        return df.assign(**{c: [] for c in ("junction_pos0", "reach_ok", "score_frac")})
+
+    junctions = [compute_junction_position(h, h["side"]) for _, h in df.iterrows()]
+    df["junction_pos0"] = [j for j, _ in junctions]
+    df["reach_ok"] = [r for _, r in junctions]
+
+    # fully deterministic order -- ties are exactly the repeat case this is
+    # meant to handle, so "whichever row pandas saw first" is not good enough
+    df = df.sort_values(["bitscore", "evalue", "sstart"], ascending=[False, True, True])
+    df = df.drop_duplicates(subset=["qseqid", "ref_genome", "contig", "junction_pos0"],
+                            keep="first")
+
+    best = df.groupby(["qseqid", "ref_genome"])["bitscore"].transform("max")
+    df["score_frac"] = df["bitscore"] / best
+    df = df[df["score_frac"] >= min_score_frac]
+
+    df = df.groupby(["qseqid", "ref_genome"], sort=False).head(max_candidates)
+    return df.reset_index(drop=True)
+
+
+def select_hits(candidates: pd.DataFrame, clusters: pd.DataFrame,
+                 max_gap: float = DEFAULT_MAX_PAIR_GAP) -> pd.DataFrame:
+    """Choose one locus per (qseqid, ref_genome), preferring placements that let
+    a left and a right overhang of the same IS element sit at the same junction.
+
+    Two passes:
+
+      1. Pairing. Every cross-side candidate pair within one
+         (sample, is_element, ref_genome, contig, sstrand) group whose junction
+         positions are within max_gap is scored by score_frac_left +
+         score_frac_right, tiebroken by the smaller gap. Pairs are accepted
+         greedily best-first, one placement per cluster. Because a cluster's own
+         best hit scores score_frac == 1.0, a pair of best hits outscores any
+         rescue -- so when the naive choice already pairs, this changes nothing.
+
+      2. Fallback. Any cluster with no accepted pairing keeps its best-scoring
+         candidate, i.e. exactly the old best_hit_per_genome() behaviour.
+
+    Pair candidacy requires reach_ok: an HSP that stops short of the
+    junction-adjacent end has an unreliable junction coordinate, so pairing on it
+    would be noise. The fallback does NOT require it -- a hit that fails reach_ok
+    is still reported, it just gets classified "intergenic" downstream, exactly as
+    before.
+
+    The compatibility rule (same contig, same sstrand, abs(gap) < max_gap,
+    one-to-one greedy) is deliberately identical to
+    pairing/add_pairing_column.py's, so a placement chosen here is one that the
+    pairing step will actually pair.
+    """
+    if candidates.empty:
+        return candidates
+
+    meta = clusters.set_index("cluster_key")[["sample", "is_element"]]
+    c = candidates.join(meta, on="qseqid")
+
+    chosen: dict[tuple, int] = {}
+
+    # --- pass 1: pairing-aware placement
+    pairs = []
+    pairable = c[c["reach_ok"]]
+    for _, grp in pairable.groupby(["sample", "is_element", "ref_genome", "contig", "sstrand"],
+                                    sort=False):
+        left = grp[grp["side"] == "left"]
+        right = grp[grp["side"] == "right"]
+        for li, lrow in left.iterrows():
+            for ri, rrow in right.iterrows():
+                gap = abs(rrow["junction_pos0"] - lrow["junction_pos0"])
+                if gap >= max_gap:
+                    continue
+                pairs.append((lrow["score_frac"] + rrow["score_frac"], gap, li, ri))
+
+    # best combined alignment quality first, then tightest junction
+    pairs.sort(key=lambda t: (-t[0], t[1]))
+    for _score, _gap, li, ri in pairs:
+        lkey = (c.at[li, "qseqid"], c.at[li, "ref_genome"])
+        rkey = (c.at[ri, "qseqid"], c.at[ri, "ref_genome"])
+        if lkey in chosen or rkey in chosen:
+            continue
+        chosen[lkey] = li
+        chosen[rkey] = ri
+
+    n_paired = len(chosen)
+    # a rescue is a paired placement that is NOT the cluster's own best hit --
+    # i.e. one the old best-hit-only selection would have got wrong
+    n_rescued = sum(1 for i in chosen.values() if c.at[i, "score_frac"] < 1.0)
+
+    # --- pass 2: unpaired clusters keep their best hit
+    for key, grp in c.groupby(["qseqid", "ref_genome"], sort=False):
+        if key not in chosen:
+            chosen[key] = grp.index[0]  # candidates are already sorted best-first
+
+    print(f"  placed {n_paired} cluster-hits by pairing "
+          f"({n_rescued} onto a non-best locus), {len(chosen) - n_paired} by best hit")
+
+    out = c.loc[sorted(chosen.values())].drop(columns=["sample", "is_element"])
+    # assemble_table emits one row per hit row, so a duplicate here would
+    # silently double a cluster's rows in the final table
+    assert not out.duplicated(subset=["qseqid", "ref_genome"]).any(), \
+        "select_hits must return at most one hit per (cluster, ref_genome)"
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -498,6 +641,10 @@ def main():
                          "(not shared --output_dir) when multiple invocations of this script run "
                          "concurrently against the same --output_dir -- otherwise their query "
                          "FASTAs collide on the same filename.")
+    p.add_argument("--max_pair_gap", type=float, default=DEFAULT_MAX_PAIR_GAP,
+                    help="max bp between a left and right overhang's junction positions for "
+                         "select_hits to treat them as the same insertion junction. MUST match "
+                         "pairing/add_pairing_column.py's --max-gap.")
     p.add_argument("--read_stats", nargs="*", default=None,
                     help="per-sample read-stats TSVs (sample/n_reads/total_bases/"
                          "mean_read_length) from the Snakefile's read_stats rule. With "
@@ -530,7 +677,8 @@ def main():
     blast_df = run_blast(query_fasta, args.blastdb, threads=args.threads)
     print(f"  {len(blast_df)} raw HSPs")
 
-    hits = best_hit_per_genome(blast_df)
+    candidates = candidate_hits_per_genome(blast_df, clusters)
+    hits = select_hits(candidates, clusters, max_gap=args.max_pair_gap)
     print(f"  {len(hits)} hits pass pident>={MIN_PIDENT} qcov>={MIN_QCOV}")
 
     print("Loading CDS intervals from masked gbff files...")
