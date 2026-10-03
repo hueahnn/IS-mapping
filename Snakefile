@@ -1,94 +1,187 @@
 # IS-element insertion pipeline: given a list of SRA accession IDs, downloads
-# each genome's reads, aligns them to an IS-element database (ISfinder +
-# ISOSDB) and a transposon database (TnCentral), extracts and clusters the sequence "overhangs" flanking every IS hit, BLASTs
-# those clusters against masked E. coli reference genomes to classify whether
-# the insertion disrupted a gene, and pairs up left/right overhang clusters
-# that land at the same insertion junction.
+# each genome's reads, aligns them to one or more IS-element / transposon
+# databases, extracts and clusters the sequence "overhangs" flanking every
+# element hit, BLASTs those clusters against masked E. coli reference genomes
+# to classify whether the insertion disrupted a gene, and pairs up left/right
+# overhang clusters that land at the same insertion junction.
 # begin: 06/18/2026
 # run: snakemake --profile slurmprofile --rerun-incomplete --use-conda --executor slurm
+#
+# All settings live in config/config.yaml (databases in config/databases.tsv);
+# this file should not need editing to run on new data.
 
+import csv
 import os
 import re
 
-# accession list to run the pipeline over
-ACCESSIONS_PATH = config.get("input_path", "/home/hua575/baymlab/mapping/atb/ecoli_atb_sra_accessions.txt")
+from snakemake.exceptions import WorkflowError
+
+SCRIPT_DIR = workflow.basedir  # repository root; scripts and relative config paths resolve from here
+
+configfile: os.path.join(SCRIPT_DIR, "config", "config.yaml")
+
+
+# ---------------------------------------------------------------------------
+# read and check the config -- every problem is collected and reported at once
+# ---------------------------------------------------------------------------
+
+_problems = []
+
+
+def _resolve(path):
+	"""Relative config paths are relative to the repository root."""
+	path = os.path.expanduser(str(path))
+	return path if os.path.isabs(path) else os.path.join(SCRIPT_DIR, path)
+
+
+def _setting(*keys):
+	"""config[keys[0]][keys[1]]..., recording a problem if any level is missing."""
+	value = config
+	for depth, key in enumerate(keys):
+		if not isinstance(value, dict) or key not in value:
+			_problems.append(f"missing setting '{': '.join(keys[:depth + 1])}' in config/config.yaml")
+			return None
+		value = value[key]
+	return value
+
+
+def _existing(path, what, suffix=""):
+	"""Resolve a path setting and record a problem if the file is missing."""
+	if path is None:
+		return None
+	path = _resolve(path)
+	if not os.path.exists(path + suffix):
+		_problems.append(f"{what} not found: {path + suffix}")
+	return path
+
+
+def _number(*keys, kind=float):
+	value = _setting(*keys)
+	if value is None:
+		return None
+	try:
+		return kind(value)
+	except (TypeError, ValueError):
+		_problems.append(f"setting '{': '.join(keys)}' must be a number, got {value!r}")
+		return None
+
+
+def _read_databases(path):
+	"""label -> fasta from databases.tsv (# comment lines and blank lines skipped)."""
+	databases = {}
+	if path is None or not os.path.exists(path):
+		return databases
+	with open(path) as fh:
+		rows = csv.DictReader((l for l in fh if l.strip() and not l.startswith("#")), delimiter="\t")
+		missing = {"label", "fasta"} - set(rows.fieldnames or [])
+		if missing:
+			_problems.append(f"{path}: header line must have columns 'label' and 'fasta' "
+							 f"(tab-separated), missing {sorted(missing)}")
+			return databases
+		for n, row in enumerate(rows, start=1):
+			label, fasta = (row["label"] or "").strip(), (row["fasta"] or "").strip()
+			if not re.fullmatch(r"[A-Za-z0-9_-]+", label):
+				_problems.append(f"{path}, database {n}: label {label!r} may only contain "
+								 "letters, digits, '_' or '-'")
+			elif label in databases:
+				_problems.append(f"{path}: database label {label!r} is listed twice")
+			elif not fasta:
+				_problems.append(f"{path}: database {label!r} has no fasta path")
+			else:
+				databases[label] = _existing(fasta, f"FASTA for database {label!r}")
+	if not databases and not any("databases" in p for p in _problems):
+		_problems.append(f"{path}: no databases listed")
+	return databases
+
+
+# what to run on
+ACCESSIONS_PATH = _existing(_setting("accessions"), "accession list")
+DATABASES = _read_databases(_existing(_setting("databases"), "database table"))
+
+# where to write. Every per-sample output lives under OUTPUT_DIR.
+OUTPUT_DIR = _resolve(_setting("output_dir") or "")
+# Kept out of OUTPUT_DIR on purpose: if the index were purged and rebuilt, its
+# new mtime would make every existing bam look out of date (rerun-triggers is
+# mtime-only, see slurmprofile/config.yaml) and re-queue every accession.
+INDEX_DIR = _resolve(_setting("index_dir") or "")                        # index_database, reference_table, bwa_isfinder
+REFERENCES_TSV = os.path.join(INDEX_DIR, "references.tsv")               # reference_table
+
+# reference genomes / BLAST db for blast_clusters_to_ref (see scripts/masking.py)
+REF_GENOMES_DIR = _existing(_setting("reference_genomes", "dir"), "reference genome folder")
+REF_ACCESSIONS = _setting("reference_genomes", "accessions") or []
+GBFF_SUFFIX = _setting("reference_genomes", "gbff_suffix")
+BLASTDB = _existing(_setting("reference_genomes", "blast_db"), "BLAST database", suffix=".nsq")
+REF_GBFFS = [
+	_existing(os.path.join(REF_GENOMES_DIR or "", acc, f"{acc}_{GBFF_SUFFIX}.gbff"),
+			  f"annotation for reference genome {acc}")
+	for acc in REF_ACCESSIONS
+]
+REF_ACCESSIONS_STR = " ".join(REF_ACCESSIONS)  # shell {}-formatting can't eval " ".join(...) inline
+
+# run_accession -> assembled genome length, for blast_clusters_to_ref's
+# est_coverage denominator (see scripts/build_genome_size_table.py). Optional.
+GENOME_SIZES = _setting("genome_sizes")
+GENOME_SIZES = _existing(GENOME_SIZES, "genome size table") if GENOME_SIZES else None
+
+# overhang extraction (scripts/overhangs.py)
+MIN_ELEMENT_COVERAGE_DEPTH = _number("overhangs", "min_element_coverage_depth", kind=int)
+MIN_ELEMENT_COVERAGE_FRACTION = _number("overhangs", "min_element_coverage_fraction")
+MIN_MAPQ = _number("overhangs", "min_mapq", kind=int)
+MIN_PIDENT = _number("overhangs", "min_pident")
+MIN_CLIP_LEN = _number("overhangs", "min_clip_len", kind=int)
+BOUNDARY_TOLERANCE = _number("overhangs", "boundary_tolerance", kind=int)
+
+# clustering (scripts/cluster_overhangs_edlib.py, recruit_ambiguous_overhangs.py)
+MAX_EDIT_FRAC = _number("clustering", "max_edit_frac")
+MERGE_EDIT_FRAC = _number("clustering", "merge_edit_frac")
+MIN_CLUSTER_SIZE = _number("clustering", "min_cluster_size", kind=int)
+RECRUIT_EDIT_FRAC = _number("clustering", "recruit_edit_frac")
+
+# Max bp between a left and right overhang's junction positions for them to count
+# as the same insertion junction. Passed to BOTH blast_clusters_to_ref (which uses
+# it when deciding WHERE to place each overhang) and add_pairing_column (which
+# uses it to actually pair them). If the two ever disagree, the BLAST step would
+# place overhangs to satisfy a rule the pairing step then rejects.
+MAX_PAIR_GAP = _number("max_pair_gap", kind=int)
+
+# software
+SRA_TOOLS_ENV = _existing(_setting("conda_envs", "sra_tools"), "conda env file 'sra_tools'")
+MINIBWA_ENV = _existing(_setting("conda_envs", "minibwa"), "conda env file 'minibwa'")
+PYTHON_PYSAM = _existing(_setting("python", "pysam"), "python interpreter 'pysam'")
+PYTHON_PANDAS = _existing(_setting("python", "pandas"), "python interpreter 'pandas'")
+
+if _problems:
+	raise WorkflowError("Problems with the pipeline configuration:\n  - " + "\n  - ".join(_problems)
+						+ "\n(settings: config/config.yaml, databases: config/databases.tsv)")
+
 with open(ACCESSIONS_PATH) as f:
 	ACCESSIONS = [line.strip() for line in f if line.strip()]
 
-# scratch working directory holding all per-accession intermediate/output files
-PATH = "/n/scratch/users/h/hua575/atb_filtered"
-FASTQ_DIR = os.path.join(PATH, "fastq-files")                     # fasterq, bwa_isfinder, remove_fastqs
-BAM_DIR = os.path.join(PATH, "bam-files")                         # bwa_isfinder, clip_and_cluster
-REMOVE_DIR = os.path.join(PATH, "removed")                        # remove_fastqs
-READ_STATS_DIR = os.path.join(PATH, "read_stats")                 # read_stats, blast_clusters_to_ref
-OVERHANG_DIR = os.path.join(PATH, "overhangs")                    # clip_and_cluster
-CLUSTER_DIR = os.path.join(PATH, "clusters")                      # clip_and_cluster, recruit_ambiguous
+FASTQ_DIR = os.path.join(OUTPUT_DIR, "fastq-files")                     # fasterq, bwa_isfinder, remove_fastqs
+BAM_DIR = os.path.join(OUTPUT_DIR, "bam-files")                         # bwa_isfinder, clip_and_cluster
+REMOVE_DIR = os.path.join(OUTPUT_DIR, "removed")                        # remove_fastqs
+READ_STATS_DIR = os.path.join(OUTPUT_DIR, "read_stats")                 # read_stats, blast_clusters_to_ref
+OVERHANG_DIR = os.path.join(OUTPUT_DIR, "overhangs")                    # clip_and_cluster
+CLUSTER_DIR = os.path.join(OUTPUT_DIR, "clusters")                      # clip_and_cluster, recruit_ambiguous
 # recruit_ambiguous writes an augmented copy of clusters/{id}/{id}.reads.tsv
 # here, with the ambiguous-MAPQ overhangs folded into the clusters they match.
 # A separate directory because two rules cannot declare the same output file;
 # blast_clusters_to_ref reads from here instead of CLUSTER_DIR.
-RECRUITED_DIR = os.path.join(PATH, "clusters_recruited")          # recruit_ambiguous, blast_clusters_to_ref
-GENE_DISRUPTION_DIR = os.path.join(PATH, "gene_disruption")       # blast_clusters_to_ref
-PAIRED_DIR = os.path.join(PATH, "gene_disruption_paired")         # add_pairing_column
+RECRUITED_DIR = os.path.join(OUTPUT_DIR, "clusters_recruited")          # recruit_ambiguous, blast_clusters_to_ref
+GENE_DISRUPTION_DIR = os.path.join(OUTPUT_DIR, "gene_disruption")       # blast_clusters_to_ref
+PAIRED_DIR = os.path.join(OUTPUT_DIR, "gene_disruption_paired")         # add_pairing_column
 
-SCRIPT_DIR = "/n/data1/hms/dbmi/baym/hue/mapping"                   # clip_and_cluster, blast_clusters_to_ref, add_pairing_column
-# Databases reads are aligned to, as {label: fasta}. Override with a config
-# file (--configfile), e.g.
-#   databases:
-#     IS: /path/to/is_elements.fa
-#     Tn: /path/to/transposons.fa
-# index_database copies and indexes each one; bwa_isfinder maps every sample to
-# each database SEPARATELY and merges the results. Separate rather than one
-# combined index because transposon databases carry IS entries and transposons
-# containing IS copies: combined, reads from those ISs would map equally well
-# to both and come out MAPQ 0. Each alignment is tagged with its database's
-# label as its read group (RG:Z:<label>), which overhangs.py carries into its
-# manifest's "database" column, and REFERENCES_TSV maps every reference name to
-# its database for joining onto any downstream table. Reference names must be
-# unique across databases (reference_table fails otherwise), since every
-# downstream output is keyed by them.
-DATABASES = config.get("databases", {
-	"IS": "/home/hua575/baymlab/mapping/IS_Tn_database/IS_DB_merged.collapsed95.fa",  # ISfinder + ISOSDB, cd-hit 95%
-	"Tn": "/home/hua575/baymlab/mapping/IS_Tn_database/TE.database.clean.fa",         # TnCentral
-})
-for _label in DATABASES:
-	if not re.fullmatch(r"[A-Za-z0-9_-]+", _label):
-		raise ValueError(f"database label {_label!r} must be letters, digits, '_' or '-' "
-						 "(it becomes a read group ID and part of file names)")
-
-# Kept out of the scratch PATH on purpose: if the index were purged and rebuilt,
-# its new mtime would make every existing bam look out of date (rerun-triggers
-# is mtime-only, see slurmprofile/config.yaml) and re-queue every accession.
-INDEX_DIR = config.get("index_dir", os.path.join(SCRIPT_DIR, "db_index"))   # index_database, reference_table, bwa_isfinder
-REFERENCES_TSV = os.path.join(INDEX_DIR, "references.tsv")                 # reference_table
-
-# run_accession -> assembled genome length, for blast_clusters_to_ref's
-# est_coverage denominator. Built once by scripts/build_genome_size_table.py
-# from atb/ecoli_atb_filtered.csv; see that script for why the per-sample size
-# is used rather than a fixed E. coli constant.
-GENOME_SIZES = os.path.join(SCRIPT_DIR, "atb", "genome_size_table.tsv")
-
-# reference genomes / BLAST db for blast_clusters_to_ref (masking.py's
-# ISfinder-BLAST-based excision -- see scripts/masking.py)
-REF_GENOMES_DIR = "/home/hua575/baymlab/mapping/ref_genomes/ecoli"
-REF_ACCESSIONS = [  # must match the accessions BLASTDB below was built from
-	"GCA_000005845.2", "GCA_900096825.1", "GCA_000692435.1",
-	"GCA_002473875.1", "GCA_000163235.1", "GCA_002966755.1",
-]
-REF_ACCESSIONS_STR = " ".join(REF_ACCESSIONS)  # shell {}-formatting can't eval " ".join(...) inline
-BLASTDB = "/home/hua575/baymlab/mapping/ref_genomes/blastdb/ecoli_masked_combined_v2"
-GBFF_SUFFIX = "no_IS_v2"
-
-# Max bp between a left and right overhang's junction positions for them to count
-# as the same insertion junction. Defined once and passed to BOTH
-# blast_clusters_to_ref (which uses it when deciding WHERE to place each overhang)
-# and add_pairing_column (which uses it to actually pair them). If the two ever
-# disagree, the BLAST step would place overhangs to satisfy a rule the pairing
-# step then rejects.
-MAX_PAIR_GAP = 50
-REF_GBFFS = expand(
-	os.path.join(REF_GENOMES_DIR, "{acc}", "{acc}_" + GBFF_SUFFIX + ".gbff"), acc=REF_ACCESSIONS
-)
+# Each configured database is copied and indexed by index_database, and every
+# sample is mapped to each one SEPARATELY by bwa_isfinder, then merged.
+# Separate rather than one combined index because transposon databases carry
+# IS entries and transposons containing IS copies: combined, reads from those
+# ISs would map equally well to both and come out MAPQ 0. Each alignment is
+# tagged with its database's label as its read group (RG:Z:<label>), which
+# overhangs.py carries into its manifest's "database" column, and
+# REFERENCES_TSV maps every reference name to its database for joining onto
+# any downstream table. Reference names must be unique across databases
+# (reference_table fails otherwise), since every downstream output is keyed by
+# them.
 
 # accession IDs never contain a dot, so {id} can't ambiguously match a
 # "{id}.tar.gz" archive output.
@@ -110,22 +203,22 @@ rule all:
 rule prefetch:
 	group: "align_is"
 	output:
-		temp(os.path.join(PATH, "{id}", "{id}.sra"))
+		temp(os.path.join(OUTPUT_DIR, "{id}", "{id}.sra"))
 	log:
 		"logs/prefetch/{id}.log"
 	resources:
 		runtime="5m",
 		mem_mb=100
-	conda: "/home/hua575/baymlab/sibmi/conda-envs/ncbi-datasets.yaml"
+	conda: SRA_TOOLS_ENV
 	shell:
 		"""
-		prefetch {wildcards.id} --output-directory {PATH} > {log} 2>&1
+		prefetch {wildcards.id} --output-directory {OUTPUT_DIR} > {log} 2>&1
 		"""
 
 rule fasterq:
 	group: "align_is"
 	input:
-		os.path.join(PATH, "{id}", "{id}.sra")
+		os.path.join(OUTPUT_DIR, "{id}", "{id}.sra")
 	output:
 		layout=os.path.join(FASTQ_DIR, "{id}.layout")
 	log:
@@ -133,7 +226,7 @@ rule fasterq:
 	resources:
 		runtime="10m",
 		mem="1G"
-	conda: "/home/hua575/baymlab/sibmi/conda-envs/ncbi-datasets.yaml"
+	conda: SRA_TOOLS_ENV
 	shell:
 		"""
 		set -euo pipefail
@@ -163,7 +256,7 @@ rule index_database:
 	resources:
 		runtime="30m",
 		mem="4G"
-	conda: "/home/hua575/baymlab/sibmi/conda-envs/minibwa.yaml"
+	conda: MINIBWA_ENV
 	shell:
 		"""
 		set -euo pipefail
@@ -231,7 +324,7 @@ rule bwa_isfinder:
 	resources:
 		runtime="10m",
 		mem="1G"
-	conda: "/home/hua575/baymlab/sibmi/conda-envs/minibwa.yaml"
+	conda: MINIBWA_ENV
 	params:
 		fastq_dir=FASTQ_DIR,
 		index_dir=INDEX_DIR,
@@ -348,7 +441,7 @@ rule remove_fastqs:
 	resources:
 		runtime="1m",
 		mem="100M"
-	conda: "/home/hua575/baymlab/sibmi/conda-envs/minibwa.yaml"
+	conda: MINIBWA_ENV
 	params:
 		fastq_dir=FASTQ_DIR
 	shell:
@@ -411,8 +504,12 @@ rule clip_and_cluster:
 		trap 'rm -rf "$WORK"' EXIT
 
 		# stage 1: clip overhangs from the bam (needs pysam/samtools -- minibwa env)
-		/home/hua575/miniconda3/envs/minibwa/bin/python {input.overhang_script} \
-			{input.bam} "$OVERHANG_WORK" --sample_id {wildcards.id} --skip_is_hit_filter
+		{PYTHON_PYSAM} {input.overhang_script} \
+			{input.bam} "$OVERHANG_WORK" --sample_id {wildcards.id} --skip_is_hit_filter \
+			--min_is_coverage_depth {MIN_ELEMENT_COVERAGE_DEPTH} \
+			--min_is_coverage_fraction {MIN_ELEMENT_COVERAGE_FRACTION} \
+			--min_mapq {MIN_MAPQ} --min_pident {MIN_PIDENT} \
+			--min_clip_len {MIN_CLIP_LEN} --boundary_tolerance {BOUNDARY_TOLERANCE}
 
 		# stage 2: cluster each is_element/side pair with a position-anchored edit
 		# distance (edlib SHW/prefix mode) instead of CD-HIT's percent-identity +
@@ -423,12 +520,13 @@ rule clip_and_cluster:
 		# TODO(infra): `edlib` (pip install edlib, pure C++ ext, no Rust toolchain)
 		# is not yet installed in the bakta env -- add it there before this rule
 		# will run (bakta already has pandas, needed here too, so reusing it avoids
-		# a new env). Update the interpreter path below if a different env is used.
-		/home/hua575/miniconda3/envs/bakta/bin/python {input.cluster_script} \
+		# a new env). Set python: pandas in config/config.yaml if a different env is used.
+		{PYTHON_PANDAS} {input.cluster_script} \
 			"$OVERHANG_WORK/{wildcards.id}.manifest.tsv" \
 			--sample_id {wildcards.id} \
 			--output_dir "$CLUSTER_WORK" \
-			--max_edit_frac 0.10 --merge_edit_frac 0.15 --min_cluster_size 2
+			--max_edit_frac {MAX_EDIT_FRAC} --merge_edit_frac {MERGE_EDIT_FRAC} \
+			--min_cluster_size {MIN_CLUSTER_SIZE}
 
 		# persist only the small, useful results. cluster_overhangs_edlib.py's
 		# manifest (is_element/side/n_in/n_clusters) carries no tmpdir-relative
@@ -498,12 +596,12 @@ rule recruit_ambiguous:
 		# an archive with no __ambiguous files is fine and expected for any data
 		# produced before overhangs.py grew the ZA tag -- the script then just
 		# passes the clustered reads through with recruited=0.
-		/home/hua575/miniconda3/envs/bakta/bin/python {input.script} \
+		{PYTHON_PANDAS} {input.script} \
 			--reads_tsv {input.reads_tsv} \
 			--overhang_dir "$WORK" \
 			--sample_id {wildcards.id} \
 			--output_dir {RECRUITED_DIR}/{wildcards.id} \
-			--recruit_edit_frac 0.10
+			--recruit_edit_frac {RECRUIT_EDIT_FRAC}
 		"""
 
 
@@ -521,8 +619,11 @@ rule blast_clusters_to_ref:
 		script=os.path.join(SCRIPT_DIR, "scripts", "blast_clusters_to_ref.py"),
 		blastdb_file=BLASTDB + ".nsq",
 		read_stats=os.path.join(READ_STATS_DIR, "{id}.tsv"),
-		genome_sizes=GENOME_SIZES,
+		genome_sizes=[GENOME_SIZES] if GENOME_SIZES else [],
 		ref_gbffs=REF_GBFFS
+	params:
+		# genome_sizes is optional; without it est_coverage/coverage_fraction stay empty
+		genome_sizes_arg=f"--genome_sizes {GENOME_SIZES}" if GENOME_SIZES else ""
 	output:
 		os.path.join(GENE_DISRUPTION_DIR, "{id}.zip")
 	log:
@@ -545,7 +646,7 @@ rule blast_clusters_to_ref:
 		mkdir -p "$TMP_DIR"
 		trap 'rm -rf "$TMP_DIR"' EXIT
 
-		/home/hua575/miniconda3/envs/bakta/bin/python {input.script} \
+		{PYTHON_PANDAS} {input.script} \
 			--cluster_dirs {RECRUITED_DIR}/{wildcards.id} \
 			--blastdb {BLASTDB} \
 			--ref_genomes_dir {REF_GENOMES_DIR} \
@@ -555,7 +656,7 @@ rule blast_clusters_to_ref:
 			--tmp_dir "$TMP_DIR" \
 			--threads {threads} \
 			--read_stats {input.read_stats} \
-			--genome_sizes {input.genome_sizes} \
+			{params.genome_sizes_arg} \
 			--max_pair_gap {MAX_PAIR_GAP}
 		"""
 
@@ -579,5 +680,5 @@ rule add_pairing_column:
 		set -euo pipefail
 		exec > {log} 2>&1
 
-		/home/hua575/miniconda3/envs/minibwa/bin/python {input.script} --zip {input.zip} --out-dir {PAIRED_DIR} --max-gap {MAX_PAIR_GAP}
+		{PYTHON_PYSAM} {input.script} --zip {input.zip} --out-dir {PAIRED_DIR} --max-gap {MAX_PAIR_GAP}
 		"""

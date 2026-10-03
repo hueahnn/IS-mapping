@@ -1,0 +1,86 @@
+wrote IS_DB_merged.fa (28640 sequences: 5927 ISfinder + 22713 ISOSDB)
+================================================================
+Program: CD-HIT, V4.8.1 (+OpenMP), Apr 24 2025, 22:00:32
+Command: /home/hua575/miniconda3/envs/cd-hit/bin/cd-hit-est -i
+         IS_DB_merged.fa -o IS_DB_merged.collapsed95.fa -c 0.95
+         -n 10 -d 0 -M 0 -T 1
+
+Started: Fri Oct  2 18:32:10 2026
+================================================================
+                            Output                              
+----------------------------------------------------------------
+Warning: from file "IS_DB_merged.fa",
+Discarding invalid sequence or sequence without identifier and description!
+
+>IS405
+-
+Warning: from file "IS_DB_merged.fa",
+Discarding invalid sequence or sequence without identifier and description!
+
+>IS22
+-
+Warning: from file "IS_DB_merged.fa",
+Discarding invalid sequence or sequence without identifier and description!
+
+>IS897
+-
+Warning: from file "IS_DB_merged.fa",
+Discarding invalid sequence or sequence without identifier and description!
+
+>ISRhf1
+-
+Warning: from file "IS_DB_merged.fa",
+Discarding invalid sequence or sequence without identifier and description!
+
+>ISXc1
+-
+Warning: from file "IS_DB_merged.fa",
+Discarding invalid sequence or sequence without identifier and description!
+
+>IS92R
+-
+Warning: from file "IS_DB_merged.fa",
+Discarding invalid sequence or sequence without identifier and description!
+
+>IS92L
+-
+Warning: from file "IS_DB_merged.fa",
+Discarding invalid sequence or sequence without identifier and description!
+
+>ISLd1
+-
+Warning: from file "IS_DB_merged.fa",
+Discarding invalid sequence or sequence without identifier and description!
+
+>IS70
+-
+total seq: 28631
+longest and shortest : 26712 and 242
+Total letters: 40964611
+Sequences have been sorted
+
+Approximated minimal memory consumption:
+Sequence        : 44M
+Buffer          : 1 X 23M = 23M
+Table           : 1 X 17M = 17M
+Miscellaneous   : 4M
+Total           : 89M
+
+Table limit with the given memory limit:
+Max number of representatives: 4000000
+Max number of word counting entries: 774856000
+
+comparing sequences from          0  to      28631
+....................    10000  finished       9368  clusters
+....................    20000  finished      18609  clusters
+........
+    28631  finished      26563  clusters
+
+Approximated maximum memory consumption: 391M
+writing new database
+writing clustering information
+program completed !
+
+Total CPU time 31.29
+wrote IS_DB_merged.collapsed95.fa (26563 representatives from 28640 input sequences)
+copied TE.database.fa

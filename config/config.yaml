@@ -1,0 +1,114 @@
+# ============================================================================
+# IS-mapping pipeline configuration
+#
+# Edit this file, or copy it and run with `--configfile my_config.yaml`
+# (settings in your copy override the ones here; anything you leave out keeps
+# the value below). Single settings can also be overridden on the command
+# line, e.g. `--config accessions=my_list.txt`.
+#
+# Relative paths are relative to the repository root (the folder holding the
+# Snakefile). The pipeline checks this file before starting and lists every
+# problem it finds.
+# ============================================================================
+
+
+# ---- What to run on --------------------------------------------------------
+
+# Text file with one SRA run accession per line (e.g. SRR8275060).
+accessions: atb/ecoli_atb_sra_accessions.txt
+
+# Table of IS / transposon databases to align reads to -- see
+# config/databases.tsv for the format.
+databases: config/databases.tsv
+
+
+# ---- Where to write --------------------------------------------------------
+
+# All per-sample outputs (reads, bams, overhangs, clusters, gene-disruption
+# tables). Can be large; scratch space is fine.
+output_dir: /n/scratch/users/h/hua575/atb_filtered
+
+# Where database indexes are built. Keep this somewhere that is NOT purged:
+# if an index is rebuilt, every sample aligned to it is treated as out of date
+# and re-run.
+index_dir: db_index
+
+
+# ---- Reference genomes (gene-disruption calls) -----------------------------
+
+reference_genomes:
+  # Folder with one subfolder per accession, each holding
+  # {accession}_{gbff_suffix}.gbff
+  dir: /home/hua575/baymlab/mapping/ref_genomes/ecoli
+  accessions:
+    - GCA_000005845.2
+    - GCA_900096825.1
+    - GCA_000692435.1
+    - GCA_002473875.1
+    - GCA_000163235.1
+    - GCA_002966755.1
+  # Which annotation file to read: no_IS (annotation-based masking) or
+  # no_IS_v2 (ISfinder-BLAST-based masking). Must match blast_db.
+  gbff_suffix: no_IS_v2
+  # BLAST database built from the same masked genomes (path prefix, no
+  # extension).
+  blast_db: /home/hua575/baymlab/mapping/ref_genomes/blastdb/ecoli_masked_combined_v2
+
+# Optional: table of run_accession -> assembled genome length, used to
+# estimate each sample's sequencing depth (coverage_fraction column). Leave
+# empty ("") to skip; those columns are then left blank.
+genome_sizes: atb/genome_size_table.tsv
+
+
+# ---- Overhang extraction ---------------------------------------------------
+
+overhangs:
+  # An element is only used in a sample if at least this fraction of its
+  # length is covered by reads at this depth or more. Long transposons with
+  # variable cargo often fail this; lower it to keep them.
+  min_element_coverage_depth: 10
+  min_element_coverage_fraction: 0.9
+  # Reads below this mapping quality are kept separately as "ambiguous" and
+  # only joined to a cluster later, never used to start one.
+  min_mapq: 30
+  # Minimum percent identity of a read to the element.
+  min_pident: 90
+  # Minimum length of the clipped (flanking) part of a read.
+  min_clip_len: 5
+  # How close (bp) an alignment must end to the element's edge to count as
+  # crossing the insertion junction.
+  boundary_tolerance: 20
+
+
+# ---- Clustering and pairing ------------------------------------------------
+
+clustering:
+  # Max edit distance (as a fraction of length) for an overhang to join a
+  # cluster, and for two clusters to be merged.
+  max_edit_frac: 0.10
+  merge_edit_frac: 0.15
+  # Clusters with fewer reads than this are dropped.
+  min_cluster_size: 2
+  # Max edit distance for an ambiguous-MAPQ overhang to be recruited into an
+  # existing cluster.
+  recruit_edit_frac: 0.10
+
+# Max bp between a left and a right overhang for them to count as the two
+# sides of one insertion.
+max_pair_gap: 50
+
+
+# ---- Software --------------------------------------------------------------
+
+# Conda environment files for the download and alignment steps (used with
+# --use-conda).
+conda_envs:
+  sra_tools: /home/hua575/baymlab/sibmi/conda-envs/ncbi-datasets.yaml
+  minibwa: /home/hua575/baymlab/sibmi/conda-envs/minibwa.yaml
+
+# Python interpreters for the pipeline's scripts.
+python:
+  # needs pysam (overhang extraction, pairing)
+  pysam: /home/hua575/miniconda3/envs/minibwa/bin/python
+  # needs pandas, biopython and edlib (clustering, BLAST classification)
+  pandas: /home/hua575/miniconda3/envs/bakta/bin/python

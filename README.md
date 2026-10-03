@@ -24,21 +24,31 @@ snakemake --profile slurmprofile --rerun-incomplete --use-conda --executor slurm
 → `clip_and_cluster` (overhang extraction + position-anchored edit-distance clustering,
 see `scripts/cluster_overhangs_edlib.py`) → `blast_clusters_to_ref`
 (gene-disruption classification) → `add_pairing_column` (left/right junction pairing).
-It runs against `atb/ecoli_atb_sra_accessions.txt` by default (override with
-`--config input_path=...`).
+### Configuration
+
+Everything you'd change between runs is in two files; the Snakefile itself
+shouldn't need editing.
+
+- **[`config/config.yaml`](config/config.yaml)**: the accession list, output
+  folder, reference genomes, filtering/clustering thresholds and software paths. Each
+  setting is commented.
+- **[`config/databases.tsv`](config/databases.tsv)**: the IS / transposon
+  databases to align reads to, one per line:
+
+  ```
+  label	fasta	description
+  IS	/path/to/is_elements.fa	ISfinder + ISOSDB
+  Tn	/path/to/transposons.fa	TnCentral
+  ```
+
+To run with different settings, either edit those files or copy `config.yaml`,
+change what you need, and pass it with `--configfile my_config.yaml` (anything
+you leave out keeps its default). One-off overrides work on the command line, e.g.
+`--config accessions=my_list.txt`. Relative paths are relative to the repository root.
+Before running anything, the pipeline checks the configuration and lists every
+problem it finds (missing files, bad labels, non-numeric thresholds).
 
 ### Element databases
-
-Reads are aligned to every database listed under `databases` in the config, as
-`label: fasta`. The defaults are in the Snakefile; override them with a config file:
-
-```yaml
-# my_config.yaml -- pass with --configfile my_config.yaml
-databases:
-  IS: /path/to/is_elements.fa
-  Tn: /path/to/transposons.fa
-index_dir: /path/to/db_index   # optional, default db_index/ in the repo
-```
 
 - `index_database` checks each FASTA (no headers glued onto sequence lines, no empty or
   repeated names), copies it into `index_dir`, and builds its minibwa index there.
@@ -49,7 +59,7 @@ index_dir: /path/to/db_index   # optional, default db_index/ in the repo
   reflects its own database, and merges the results. Each alignment carries its
   database label as its read group.
 
-To separate IS from Tn evidence:
+To separate evidence by database (e.g. IS vs Tn):
 - **reads**: `samtools view -r Tn sample.bam`
 - **overhangs**: the `database` column of `overhangs/{id}/{id}.manifest.tsv`
 - **clusters / gene-disruption tables**: join `is_element` onto `references.tsv`

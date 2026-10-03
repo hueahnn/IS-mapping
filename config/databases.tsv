@@ -1,0 +1,14 @@
+# Databases to align reads to -- one per line, tab-separated.
+#
+#   label        short name for the database (letters, digits, _ or -). It
+#                tags every read and overhang so results can be split by
+#                database later.
+#   fasta        path to the FASTA file (relative paths are relative to the
+#                repository root)
+#   description  optional free text
+#
+# Every sequence name must be unique across ALL databases listed here.
+# Lines starting with # are ignored.
+label	fasta	description
+IS	/home/hua575/baymlab/mapping/IS_Tn_database/IS_DB_merged.collapsed95.fa	ISfinder + ISOSDB, collapsed at 95% identity
+Tn	/home/hua575/baymlab/mapping/IS_Tn_database/TE.database.clean.fa	TnCentral transposons
