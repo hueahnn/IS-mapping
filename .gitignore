@@ -1,0 +1,8 @@
+# alignment indexes -- rebuilt from the FASTA by the Snakefile's index_database rule
+*.l2b
+*.mbw
+db_index/
+
+# snakemake / python state
+.snakemake/
+__pycache__/
