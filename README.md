@@ -1,11 +1,11 @@
 # IS-mapping
 
-Pipeline for detecting insertions of every IS element (insertion sequence) in the
-ISfinder database across a large collection of *E. coli* short-read SRA accessions, and
-classifying whether each insertion disrupted a gene.
+Pipeline for detecting insertions of every IS element (insertion sequence) and
+transposon in user-supplied databases across a large collection of *E. coli* short-read
+SRA accessions, and classifying whether each insertion disrupted a gene.
 
-At a high level: download reads for an accession, align them to the full ISfinder
-IS-element database (not just one IS element — every one it contains), extract and
+At a high level: download reads for an accession, align them to each configured
+element database (by default ISfinder + ISOSDB, and TnCentral), extract and
 cluster the sequence "overhangs" flanking every IS hit, BLAST those clusters against
 masked (IS-excised) *E. coli* reference genomes to classify whether the insertion landed
 inside a gene, and pair up left/right overhang clusters that correspond to the same
@@ -19,12 +19,40 @@ The core per-accession pipeline is a Snakemake workflow:
 snakemake --profile slurmprofile --rerun-incomplete --use-conda --executor slurm
 ```
 
-`Snakefile` chains together: `prefetch` → `fasterq` → `bwa_isfinder` → `remove_fastqs`
+`Snakefile` chains together: `index_database` + `reference_table` (once per database)
+→ `prefetch` → `fasterq` → `bwa_isfinder` → `remove_fastqs`
 → `clip_and_cluster` (overhang extraction + position-anchored edit-distance clustering,
 see `scripts/cluster_overhangs_edlib.py`) → `blast_clusters_to_ref`
 (gene-disruption classification) → `add_pairing_column` (left/right junction pairing).
 It runs against `atb/ecoli_atb_sra_accessions.txt` by default (override with
 `--config input_path=...`).
+
+### Element databases
+
+Reads are aligned to every database listed under `databases` in the config, as
+`label: fasta`. The defaults are in the Snakefile; override them with a config file:
+
+```yaml
+# my_config.yaml -- pass with --configfile my_config.yaml
+databases:
+  IS: /path/to/is_elements.fa
+  Tn: /path/to/transposons.fa
+index_dir: /path/to/db_index   # optional, default db_index/ in the repo
+```
+
+- `index_database` checks each FASTA (no headers glued onto sequence lines, no empty or
+  repeated names), copies it into `index_dir`, and builds its minibwa index there.
+- `reference_table` writes `index_dir/references.tsv` (`reference`, `database`,
+  `length`) and fails if any reference name appears in more than one database, since
+  every downstream output is keyed by reference name alone.
+- `bwa_isfinder` maps each sample to each database separately, so a read's MAPQ only
+  reflects its own database, and merges the results. Each alignment carries its
+  database label as its read group.
+
+To separate IS from Tn evidence:
+- **reads**: `samtools view -r Tn sample.bam`
+- **overhangs**: the `database` column of `overhangs/{id}/{id}.manifest.tsv`
+- **clusters / gene-disruption tables**: join `is_element` onto `references.tsv`
 
 Everything else in the repo is analysis run on top of that pipeline's output — pooling
 results across accessions, plotting, summarizing, or re-running a stage at a different

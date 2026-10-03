@@ -397,11 +397,17 @@ def extract_overhangs_from_bam(filtered_bam_path: str, output_dir: str, sample_i
     would if confident (per ZL/ZR), it just lands in the "ambiguous" bucket instead
     of "left"/"right" for that IS element. The header's side:left/right field still
     records which end of the read was clipped -- only the output bucket changes.
+
+    The manifest's last column, "database", is the read group (RG tag) of the
+    element's reads -- the Snakefile's bwa_isfinder rule sets it to the label of
+    the database each alignment came from (e.g. "IS" or "Tn"). Empty for a BAM
+    without RG tags.
     """
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
     is_overhangs = defaultdict(list)  # (is_name, bucket) -> [(header, seq), ...]
+    database_of = {}  # is_name -> RG tag of its reads
     written = {"left": 0, "right": 0, "ambiguous": 0}
 
     with pysam.AlignmentFile(filtered_bam_path, "rb") as bam:
@@ -416,6 +422,7 @@ def extract_overhangs_from_bam(filtered_bam_path: str, output_dir: str, sample_i
             if seq is None or cigar is None:
                 continue
 
+            database_of[read.reference_name] = read.get_tag("RG") if read.has_tag("RG") else ""
             strand = "-" if read.is_reverse else "+"
             pident = read.get_tag("ZI")
             ambiguous = read.get_tag("ZA") == 1
@@ -442,14 +449,14 @@ def extract_overhangs_from_bam(filtered_bam_path: str, output_dir: str, sample_i
 
     manifest_path = output_dir / f"{sample_id}.manifest.tsv"
     with open(manifest_path, "w") as mf:
-        mf.write("is_element\tside\tn_seqs\tfasta_path\n")
+        mf.write("is_element\tside\tn_seqs\tfasta_path\tdatabase\n")
         for (is_name, side), records in is_overhangs.items():
             safe_name = is_name.replace("/", "_")
             out_path = output_dir / f"{sample_id}__{safe_name}__{side}.overhangs.fasta"
             with open(out_path, "w") as fout:
                 for header, seq in records:
                     fout.write(f"{header}\n{seq}\n")
-            mf.write(f"{is_name}\t{side}\t{len(records)}\t{out_path}\n")
+            mf.write(f"{is_name}\t{side}\t{len(records)}\t{out_path}\t{database_of[is_name]}\n")
 
     n_is = len({is_name for is_name, side in is_overhangs.keys()})
     print(f"Wrote {written['left']} left, {written['right']} right, and "

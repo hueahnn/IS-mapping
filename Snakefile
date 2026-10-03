@@ -1,6 +1,6 @@
 # IS-element insertion pipeline: given a list of SRA accession IDs, downloads
-# each genome's reads, aligns them to the ISfinder IS-element database,
-# extracts and clusters the sequence "overhangs" flanking every IS hit, BLASTs
+# each genome's reads, aligns them to an IS-element database (ISfinder +
+# ISOSDB) and a transposon database (TnCentral), extracts and clusters the sequence "overhangs" flanking every IS hit, BLASTs
 # those clusters against masked E. coli reference genomes to classify whether
 # the insertion disrupted a gene, and pairs up left/right overhang clusters
 # that land at the same insertion junction.
@@ -8,6 +8,7 @@
 # run: snakemake --profile slurmprofile --rerun-incomplete --use-conda --executor slurm
 
 import os
+import re
 
 # accession list to run the pipeline over
 ACCESSIONS_PATH = config.get("input_path", "/home/hua575/baymlab/mapping/atb/ecoli_atb_sra_accessions.txt")
@@ -31,7 +32,35 @@ GENE_DISRUPTION_DIR = os.path.join(PATH, "gene_disruption")       # blast_cluste
 PAIRED_DIR = os.path.join(PATH, "gene_disruption_paired")         # add_pairing_column
 
 SCRIPT_DIR = "/n/data1/hms/dbmi/baym/hue/mapping"                   # clip_and_cluster, blast_clusters_to_ref, add_pairing_column
-IS_DB = "ISfinder_database-master_2026/IS.database.collapsed99.fa" # bwa_isfinder
+# Databases reads are aligned to, as {label: fasta}. Override with a config
+# file (--configfile), e.g.
+#   databases:
+#     IS: /path/to/is_elements.fa
+#     Tn: /path/to/transposons.fa
+# index_database copies and indexes each one; bwa_isfinder maps every sample to
+# each database SEPARATELY and merges the results. Separate rather than one
+# combined index because transposon databases carry IS entries and transposons
+# containing IS copies: combined, reads from those ISs would map equally well
+# to both and come out MAPQ 0. Each alignment is tagged with its database's
+# label as its read group (RG:Z:<label>), which overhangs.py carries into its
+# manifest's "database" column, and REFERENCES_TSV maps every reference name to
+# its database for joining onto any downstream table. Reference names must be
+# unique across databases (reference_table fails otherwise), since every
+# downstream output is keyed by them.
+DATABASES = config.get("databases", {
+	"IS": "/home/hua575/baymlab/mapping/IS_Tn_database/IS_DB_merged.collapsed95.fa",  # ISfinder + ISOSDB, cd-hit 95%
+	"Tn": "/home/hua575/baymlab/mapping/IS_Tn_database/TE.database.clean.fa",         # TnCentral
+})
+for _label in DATABASES:
+	if not re.fullmatch(r"[A-Za-z0-9_-]+", _label):
+		raise ValueError(f"database label {_label!r} must be letters, digits, '_' or '-' "
+						 "(it becomes a read group ID and part of file names)")
+
+# Kept out of the scratch PATH on purpose: if the index were purged and rebuilt,
+# its new mtime would make every existing bam look out of date (rerun-triggers
+# is mtime-only, see slurmprofile/config.yaml) and re-queue every accession.
+INDEX_DIR = config.get("index_dir", os.path.join(SCRIPT_DIR, "db_index"))   # index_database, reference_table, bwa_isfinder
+REFERENCES_TSV = os.path.join(INDEX_DIR, "references.tsv")                 # reference_table
 
 # run_accession -> assembled genome length, for blast_clusters_to_ref's
 # est_coverage denominator. Built once by scripts/build_genome_size_table.py
@@ -64,7 +93,8 @@ REF_GBFFS = expand(
 # accession IDs never contain a dot, so {id} can't ambiguously match a
 # "{id}.tar.gz" archive output.
 wildcard_constraints:
-	id = r"[^/.]+"
+	id = r"[^/.]+",
+	db = r"[A-Za-z0-9_-]+"
 
 rule all:
 	input:
@@ -117,20 +147,95 @@ rule fasterq:
 		fi
 		"""
 
+# Copy each configured database into INDEX_DIR and build its minibwa index
+# there, so the index always matches the exact fasta it was built from. Also
+# writes one name/database/length row per reference for reference_table.
+rule index_database:
+	input:
+		lambda wc: DATABASES[wc.db]
+	output:
+		fasta=os.path.join(INDEX_DIR, "{db}.fa"),
+		l2b=os.path.join(INDEX_DIR, "{db}.fa.l2b"),
+		mbw=os.path.join(INDEX_DIR, "{db}.fa.mbw"),
+		names=os.path.join(INDEX_DIR, "{db}.references.tsv")
+	log:
+		"logs/index_database/{db}.log"
+	resources:
+		runtime="30m",
+		mem="4G"
+	conda: "/home/hua575/baymlab/sibmi/conda-envs/minibwa.yaml"
+	shell:
+		"""
+		set -euo pipefail
+		exec > {log} 2>&1
+
+		# catch the malformed-fasta failure modes that would otherwise index
+		# silently: a ">" inside a sequence line (a header glued onto the end
+		# of the previous record), a header with no sequence, a repeated name
+		awk '
+			/^>/ {{ if (name != "" && len == 0) {{ print "empty sequence: " name; bad = 1 }}
+			       name = substr($1, 2); len = 0
+			       if (name in seen) {{ print "duplicate name: " name; bad = 1 }}
+			       seen[name] = 1; next }}
+			/>/  {{ print "header glued onto a sequence line, line " NR; bad = 1 }}
+			     {{ len += length($0) }}
+			END  {{ if (name != "" && len == 0) {{ print "empty sequence: " name; bad = 1 }}
+			       exit bad }}
+		' {input}
+
+		cp {input} {output.fasta}
+		minibwa index -t 1 {output.fasta}
+
+		awk -v db={wildcards.db} '
+			/^>/ {{ if (name != "") print name "\t" db "\t" len; name = substr($1, 2); len = 0; next }}
+			     {{ len += length($0) }}
+			END  {{ if (name != "") print name "\t" db "\t" len }}
+		' {output.fasta} > {output.names}
+		"""
+
+# reference name -> database lookup across every configured database. Fails on
+# a name shared between databases: overhang files, clusters and gene-disruption
+# tables are all keyed by reference name alone, so a shared name would merge
+# two databases' evidence with no way to separate it afterwards.
+rule reference_table:
+	input:
+		expand(os.path.join(INDEX_DIR, "{db}.references.tsv"), db=DATABASES)
+	output:
+		REFERENCES_TSV
+	resources:
+		runtime="5m",
+		mem="500M"
+	shell:
+		"""
+		set -euo pipefail
+		DUPS=$(cut -f1 {input} | sort | uniq -d | head)
+		if [ -n "$DUPS" ]; then
+			echo "ERROR: reference names shared between databases:" >&2
+			echo "$DUPS" >&2
+			exit 1
+		fi
+		{{ printf "reference\tdatabase\tlength\n"; cat {input}; }} > {output}
+		"""
+
 rule bwa_isfinder:
 	group: "align_is"
 	input:
-		layout=os.path.join(FASTQ_DIR, "{id}.layout")
+		layout=os.path.join(FASTQ_DIR, "{id}.layout"),
+		indexes=expand(os.path.join(INDEX_DIR, "{db}.fa.{ext}"), db=DATABASES, ext=["l2b", "mbw"]),
+		# not read here -- depending on it makes the cross-database name check run first
+		references=REFERENCES_TSV
 	output:
 		bam=os.path.join(BAM_DIR, "{id}.bam")
 	log:
 		"logs/bwa_isfinder/{id}.log"
 	resources:
-		runtime="5m",
-		mem="500M"
+		runtime="10m",
+		mem="1G"
 	conda: "/home/hua575/baymlab/sibmi/conda-envs/minibwa.yaml"
 	params:
-		fastq_dir=FASTQ_DIR
+		fastq_dir=FASTQ_DIR,
+		index_dir=INDEX_DIR,
+		dbs=" ".join(DATABASES)
 	shell:
 		"""
 		set -euo pipefail
@@ -158,15 +263,30 @@ rule bwa_isfinder:
 		# (--min_mapq, default 30) instead of dropping them -- filtering them out
 		# here would discard MAPQ 0-19 reads before overhangs.py ever sees them,
 		# rather than preserving them for later use as intended.
-		minibwa map isfinder $READS 2> {log} | \
-		samtools view -b -F 0x904 - | \
-		samtools sort -o {output.bam} 2>> {log}
+		#
+		# one alignment per database (see DATABASES above), each MAPQ'd only
+		# against its own references and tagged RG:Z:<label>, then merged into
+		# the single bam the rest of the pipeline expects. A read can appear
+		# once per database -- e.g. at the end of a composite transposon,
+		# against both its IS and the Tn. Split by database with
+		# `samtools view -r <label>`.
+		WORK={resources.tmpdir}/bwa_isfinder.{wildcards.id}.$$
+		mkdir -p "$WORK"
+		trap 'rm -rf "$WORK"' EXIT
+
+		: > {log}
+		for DB in {params.dbs}; do
+			minibwa map -R "@RG\\tID:$DB\\tSM:{wildcards.id}" "{params.index_dir}/$DB.fa" $READS 2>> {log} | \
+			samtools view -b -F 0x904 - | \
+			samtools sort -T "$WORK/$DB.sorttmp" -o "$WORK/$DB.bam" 2>> {log}
+		done
+		samtools merge -o {output.bam} "$WORK"/*.bam 2>> {log}
 		"""
 
 # Total reads/bases per sample, summed straight off the fastqs. This HAS to run
 # before remove_fastqs deletes them and cannot be recovered afterwards: the bam
-# holds only reads that mapped to an IS element (-F 0x904 off `minibwa map
-# isfinder`), so it carries no record of the library's total size. Feeds
+# holds only reads that mapped to an IS element or transposon (-F 0x904 off
+# bwa_isfinder's `minibwa map`), so it carries no record of the library's total size. Feeds
 # blast_clusters_to_ref's est_coverage/coverage_fraction columns.
 rule read_stats:
 	group: "align_is"
