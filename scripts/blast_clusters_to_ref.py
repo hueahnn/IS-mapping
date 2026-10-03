@@ -49,8 +49,11 @@
 # alignment didn't reliably reach the junction-relevant end -- conservatively
 # treated the same as "not a disruption" rather than a separate uncertain
 # state), or "no_hit". A junction point landing in 2+ overlapping/nested CDS
-# produces up to 2 rows (gene_rank 1, 2), ranked by margin to the nearest CDS
-# edge (deepest-inside-the-gene call first).
+# produces one row per CDS (gene_rank 1, 2, ...), ranked by distance from that
+# CDS's start codon (closest first), since an insertion near the start of a
+# gene truncates more of it and is likely more deleterious. gene_offset (bp
+# from the start codon) and gene_length are reported alongside so the ranking
+# can be checked or redone on relative position.
 #
 # usage:
 #   python blast_clusters_to_ref.py \
@@ -61,6 +64,7 @@
 
 import argparse
 import subprocess
+import sys
 from bisect import bisect_right
 from pathlib import Path
 
@@ -226,6 +230,20 @@ def load_cds_intervals(ref_genomes_dir: Path, accessions: list[str], gbff_suffix
             for feature in record.features:
                 if feature.type != "CDS":
                     continue
+                # an origin-spanning CDS (join(...end, 1..n)) comes out of
+                # masking.py as one interval covering the whole circular
+                # contig, which would make every point on it "protein_coding"
+                # -- skipped until masking.py carries compound locations
+                # through (e.g. MnmG in GCA_002966755.1_no_IS_v2.gbff). Linear
+                # draft contigs are exempt: a partial CDS (<1..>n) can
+                # legitimately cover a short contig end to end.
+                if (record.annotations.get("topology") == "circular"
+                        and feature.location.start == 0
+                        and feature.location.end == len(record.seq)):
+                    print(f"WARNING: skipping whole-contig CDS "
+                          f"{feature.qualifiers.get('locus_tag', ['?'])[0]} on {acc} {record.id}",
+                          file=sys.stderr)
+                    continue
                 starts.append(int(feature.location.start))
                 ends.append(int(feature.location.end))
                 strands.append("+" if feature.location.strand == 1 else "-")
@@ -253,22 +271,24 @@ def load_cds_intervals(ref_genomes_dir: Path, accessions: list[str], gbff_suffix
     return intervals
 
 
-def genes_at_point(intervals: dict, accession: str, contig_id: str, point0: int,
-                    max_hits: int = 2) -> list[str]:
+def genes_at_point(intervals: dict, accession: str, contig_id: str,
+                    point0: int) -> list[tuple[str, int, int]]:
     """
     point0: 0-indexed genomic coordinate of the single junction-adjacent base
     (see compute_junction_position) -- a POINT-containment lookup, not a
     span-overlap one. Callers must not pass a (start, end) range here.
 
-    Returns up to `max_hits` gene names for every CDS whose half-open
-    [start, end) interval contains point0, ranked by margin = distance from
-    point0 to the nearer edge of that CDS, descending (largest margin first
-    = point sits most deeply inside that CDS -- least likely to be a
-    boundary-annotation or alignment-slop artifact). Empty list if point0
-    falls inside no CDS on this contig.
+    Returns (gene, offset, length) for EVERY CDS whose half-open [start, end)
+    interval contains point0, where offset = bp from the CDS's start codon to
+    point0 (strand-aware: a "-" strand CDS starts at its highest coordinate)
+    and length = CDS span. Empty list if point0 falls inside no CDS on this
+    contig.
 
-    Tie-break (deterministic, for equal margins -- e.g. perfectly nested or
-    symmetric CDS pairs): longer CDS wins; if still tied, gene name ascending.
+    Ranked by offset ascending: when overlapping ORFs are both struck, the
+    one hit closest to its beginning comes first, as an insertion there
+    truncates more of the protein and is likely more deleterious. Ties (e.g.
+    two CDSs sharing a start codon): shorter CDS first, since point0 then
+    sits proportionally further into the longer one; then gene name.
     """
     contig_intervals = intervals.get(accession, {}).get(contig_id)
     if not contig_intervals or not contig_intervals[0]:
@@ -283,14 +303,11 @@ def genes_at_point(intervals: dict, accession: str, contig_id: str, point0: int,
             # no CDS at or before i can possibly contain point0 anymore
             break
         if starts[i] <= point0 < ends[i]:
-            margin = min(point0 - starts[i], ends[i] - 1 - point0)
-            candidates.append((genes[i], ends[i] - starts[i], margin))
+            offset = point0 - starts[i] if strands[i] == "+" else ends[i] - 1 - point0
+            candidates.append((genes[i], offset, ends[i] - starts[i]))
 
-    # rank: margin desc, then CDS length desc, then gene name asc. Negating
-    # the numeric fields (rather than sort(..., reverse=True)) keeps the
-    # gene-name tie-break ascending -- reverse=True would flip that too.
-    candidates.sort(key=lambda c: (-c[2], -c[1], c[0]))
-    return [c[0] for c in candidates[:max_hits]]
+    candidates.sort(key=lambda c: (c[1], c[2], c[0]))
+    return candidates
 
 
 def compute_junction_position(h: pd.Series, side: str,
@@ -526,7 +543,8 @@ def assemble_table(clusters: pd.DataFrame, hits: pd.DataFrame, intervals: dict,
         if cluster_hits is None or cluster_hits.empty:
             rows.append({
                 **base, "ref_genome": None, "hit_type": "no_hit", "gene": None,
-                "gene_rank": None, "contig": None, "hit_start": None, "hit_end": None,
+                "gene_rank": None, "gene_offset": None, "gene_length": None,
+                "contig": None, "hit_start": None, "hit_end": None,
                 "hit_strand": None, "junction_pos": None, "pident": None, "evalue": None,
             })
             continue
@@ -557,10 +575,12 @@ def assemble_table(clusters: pd.DataFrame, hits: pd.DataFrame, intervals: dict,
                 # alignment not reliably reaching the junction end at all --
                 # conservatively lumped together rather than reported as if
                 # a confirmed non-disruption
-                rows.append({**row_common, "hit_type": "intergenic", "gene": None, "gene_rank": None})
+                rows.append({**row_common, "hit_type": "intergenic", "gene": None,
+                             "gene_rank": None, "gene_offset": None, "gene_length": None})
             else:
-                for rank, gene in enumerate(genes, start=1):
-                    rows.append({**row_common, "hit_type": "protein_coding", "gene": gene, "gene_rank": rank})
+                for rank, (gene, offset, length) in enumerate(genes, start=1):
+                    rows.append({**row_common, "hit_type": "protein_coding", "gene": gene,
+                                 "gene_rank": rank, "gene_offset": offset, "gene_length": length})
 
     # explicit column order (not left to dict-insertion order, which differs
     # between the no_hit branch and the per-hit branches above) -- hit_type/
@@ -568,7 +588,7 @@ def assemble_table(clusters: pd.DataFrame, hits: pd.DataFrame, intervals: dict,
     # first thing anyone reads a row for
     column_order = [
         "sample", "is_element", "side", "cluster_id",
-        "hit_type", "gene", "gene_rank",
+        "hit_type", "gene", "gene_rank", "gene_offset", "gene_length",
         "rep_seq", "query_length", "n_seqs", "est_coverage", "coverage_fraction",
         "ref_genome", "contig", "junction_pos", "hit_start", "hit_end", "hit_strand",
         "pident", "evalue",

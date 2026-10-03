@@ -42,6 +42,7 @@
 
 import argparse
 import csv
+import io
 import subprocess
 import sys
 import tarfile
@@ -53,11 +54,14 @@ import pandas as pd
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from combine_cdhit_clusters import MEMBER_RE, load_sequences, parse_header
 from blast_clusters_to_ref import (
-    best_hit_per_genome,
+    DEFAULT_MAX_CANDIDATES,
+    DEFAULT_MIN_SCORE_FRAC,
+    candidate_hits_per_genome,
     compute_junction_position,
     genes_at_point,
     load_cds_intervals,
     run_blast,
+    select_hits,
     write_query_fasta,
 )
 
@@ -88,6 +92,15 @@ REF_ACCESSIONS = [
 # 1. pool raw overhangs for the requested IS elements across every accession
 # ---------------------------------------------------------------------------
 
+def manifest_wanted(fh, is_elements_set: set) -> list:
+    """(is_element, side) pairs in a manifest that are requested and non-empty."""
+    return [
+        (row["is_element"], row["side"])
+        for row in csv.DictReader(fh, delimiter="\t")
+        if row["is_element"] in is_elements_set and int(row["n_seqs"]) > 0
+    ]
+
+
 def pool_overhangs(overhangs_dir: Path, is_elements: list, output_dir: Path) -> dict:
     """
     Stream every accession's overhangs/{acc}.tar.gz into pooled FASTAs, one
@@ -112,21 +125,27 @@ def pool_overhangs(overhangs_dir: Path, is_elements: list, output_dir: Path) -> 
     try:
         for i, archive in enumerate(archives, 1):
             sample = archive.name.removesuffix(".tar.gz")
+            # the manifest is either extracted alongside the tar.gz (original
+            # scratch layout) or only inside it (data/ecoli_overhangs layout);
+            # the extracted copy lets us skip opening archives we don't need
             manifest_path = overhangs_dir / sample / f"{sample}.manifest.tsv"
-            if not manifest_path.exists():
-                print(f"WARNING: no manifest for {sample}, skipping", file=sys.stderr)
-                continue
-
-            wanted = []
-            with open(manifest_path) as fh:
-                for row in csv.DictReader(fh, delimiter="\t"):
-                    if row["is_element"] in is_elements_set and int(row["n_seqs"]) > 0:
-                        wanted.append((row["is_element"], row["side"]))
-            if not wanted:
-                continue
+            if manifest_path.exists():
+                with open(manifest_path) as fh:
+                    wanted = manifest_wanted(fh, is_elements_set)
+                if not wanted:
+                    continue
 
             with tarfile.open(archive, "r:gz") as tf:
                 index = {Path(m.name).name: m for m in tf.getmembers() if m.isfile()}
+                if not manifest_path.exists():
+                    member = index.get(f"{sample}.manifest.tsv")
+                    if member is None:
+                        print(f"WARNING: no manifest for {sample}, skipping", file=sys.stderr)
+                        continue
+                    with tf.extractfile(member) as mf:
+                        wanted = manifest_wanted(io.TextIOWrapper(mf), is_elements_set)
+                    if not wanted:
+                        continue
                 for is_el, side in wanted:
                     member_name = f"{sample}__{is_el}__{side}.overhangs.fasta"
                     member = index.get(member_name)
@@ -260,7 +279,8 @@ def assemble_pooled_table(clusters: pd.DataFrame, hits: pd.DataFrame, intervals:
         if cluster_hits is None or cluster_hits.empty:
             rows.append({
                 **base, "ref_genome": None, "hit_type": "no_hit", "gene": None,
-                "gene_rank": None, "contig": None, "hit_start": None, "hit_end": None,
+                "gene_rank": None, "gene_offset": None, "gene_length": None,
+                "contig": None, "hit_start": None, "hit_end": None,
                 "hit_strand": None, "junction_pos": None, "pident": None, "evalue": None,
             })
             continue
@@ -287,14 +307,16 @@ def assemble_pooled_table(clusters: pd.DataFrame, hits: pd.DataFrame, intervals:
             )
 
             if not genes:
-                rows.append({**row_common, "hit_type": "intergenic", "gene": None, "gene_rank": None})
+                rows.append({**row_common, "hit_type": "intergenic", "gene": None,
+                             "gene_rank": None, "gene_offset": None, "gene_length": None})
             else:
-                for rank, gene in enumerate(genes, start=1):
-                    rows.append({**row_common, "hit_type": "protein_coding", "gene": gene, "gene_rank": rank})
+                for rank, (gene, offset, length) in enumerate(genes, start=1):
+                    rows.append({**row_common, "hit_type": "protein_coding", "gene": gene,
+                                 "gene_rank": rank, "gene_offset": offset, "gene_length": length})
 
     column_order = [
         "is_element", "side", "cluster_id",
-        "hit_type", "gene", "gene_rank",
+        "hit_type", "gene", "gene_rank", "gene_offset", "gene_length",
         "rep_seq", "query_length", "n_seqs", "n_samples",
         "ref_genome", "contig", "junction_pos", "hit_start", "hit_end", "hit_strand",
         "pident", "evalue",
@@ -361,6 +383,10 @@ def main():
                     help="max allowed |right_junction - left_junction| in bp for pairing "
                          f"left/right clusters at the same insertion site (default {DEFAULT_MAX_GAP}, "
                          "same as pairing/add_pairing_column.py)")
+    p.add_argument("--max_candidates", type=int, default=DEFAULT_MAX_CANDIDATES,
+                    help="alternative loci per (cluster, ref genome) kept in play for pairing")
+    p.add_argument("--min_score_frac", type=float, default=DEFAULT_MIN_SCORE_FRAC,
+                    help="min bitscore fraction of a cluster's best hit for an alternative locus")
     p.add_argument("--threads", type=int, default=16)
     p.add_argument("--skip_pooling", action="store_true",
                     help="reuse existing pooled {is_element}/{is_element}__{side}.overhangs.fasta "
@@ -411,8 +437,14 @@ def main():
 
         print(f"  blastn against {args.blastdb} ...")
         blast_df = run_blast(query_fasta, args.blastdb, threads=args.threads)
-        hits = best_hit_per_genome(blast_df)
-        print(f"  {len(hits)}/{len(blast_df)} HSPs pass identity/coverage thresholds")
+        # select_hits pairs within a sample; pooled clusters span every
+        # accession, so treat the whole pool as one "sample"
+        pooled = clusters.assign(sample="pooled")
+        candidates = candidate_hits_per_genome(blast_df, pooled, args.max_candidates,
+                                               args.min_score_frac)
+        hits = select_hits(candidates, pooled, args.max_gap)
+        print(f"  {len(hits)}/{len(blast_df)} HSPs selected ({len(candidates)} candidates "
+              f"passed identity/coverage thresholds)")
 
         final = assemble_pooled_table(clusters, hits, intervals)
         out_tsv = is_dir / f"{is_element}.v2_alignment.tsv"
