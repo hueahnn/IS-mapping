@@ -23,7 +23,9 @@ snakemake --profile slurmprofile --rerun-incomplete --use-conda --executor slurm
 → `prefetch` → `fasterq` → `bwa_isfinder` → `remove_fastqs`
 → `clip_and_cluster` (overhang extraction + position-anchored edit-distance clustering,
 see `scripts/cluster_overhangs_edlib.py`) → `blast_clusters_to_ref`
-(gene-disruption classification) → `add_pairing_column` (left/right junction pairing).
+(gene-disruption classification) → `add_pairing_column` (left/right junction pairing)
+→ `nested_is` + `summarize_nested_is` (IS elements inserted inside other elements, see
+[Nested IS insertions](#nested-is-insertions)).
 ### Configuration
 
 Everything you'd change between runs is in two files; the Snakefile itself
@@ -73,8 +75,8 @@ scope (e.g. per IS element instead of per accession).
 
 ## Nested IS insertions
 
-A downstream analysis, not yet a Snakemake rule, that looks for IS elements inserted
-*into other IS elements / transposons*. It starts from the overhang clusters that
+The last pipeline step looks for IS elements inserted *into other IS elements /
+transposons*. It starts from the overhang clusters that
 `blast_clusters_to_ref` marks `hit_type == no_hit` (the flank matched none of the
 reference genomes). The reference genomes are IS-masked, so a flank that is itself IS
 sequence ends up as `no_hit`. Each such flank is BLASTed against the same IS + Tn
@@ -86,19 +88,31 @@ forward orientation. The junction is the last base of a `left` overhang and the 
 base of a `right` one. So the insertion point inside Y is BLAST's `send` (left) or
 `sstart` (right), in 1-based Y coordinates.
 
-**Steps** (scripts in `nested_is/scripts/`, see below):
+**Rules.**
+- `nested_is_db` (once): joins the `index_database` copies of every
+  `config/databases.tsv` FASTA into `index_dir/nested_is/IS_Tn` and runs
+  `makeblastdb`. The nested search then always uses the databases the reads were
+  aligned to.
+- `nested_is` (per sample, `scripts/nested_is.py`): reads the sample's
+  `gene_disruption_paired/{id}.zip` and keeps the `no_hit` rows.
+  - It drops `rep_seq`s under `min_len` and BLASTs each *exactly* identical sequence
+    once. Near-identical sequences stay separate, and nothing is merged at the cluster
+    level.
+  - The search is `-task megablast -word_size 16 -evalue 1e-5 -max_target_seqs 50
+    -max_hsps 1`. On a test set, word size 16 found as many hits as full `blastn`
+    (766 vs 768 queries) at about 1/5 the runtime.
+  - Hits are joined back onto every cluster, which is then classified (below). The
+    class depends on the cluster's own `side` and `is_element`, not only on its
+    sequence.
+  - About 2 s per sample. These jobs are bundled 10 per SLURM submission
+    (`group-components: nested_is` in `slurmprofile/config.yaml`).
+- `summarize_nested_is` (once, `scripts/summarize_nested_is.py`): combines every
+  sample's table into the two summaries below.
 
-| step | script | what it does |
-|---|---|---|
-| 1 | `extract_no_hit.py` | Pulls every `no_hit` row (sample, host element, side, cluster, pairing, `rep_seq`, length, `n_seqs`) out of all `gene_disruption_paired/{id}.zip` files. |
-| 2 | `make_queries.py` | Drops `rep_seq`s under 30 bp and writes each *exactly* identical sequence once as a BLAST query (the same flank recurs across many samples). Near-identical sequences stay separate, and nothing is merged at the cluster level. |
-| 3 | `blastn` | `-task megablast -word_size 16 -evalue 1e-5 -max_target_seqs 50 -max_hsps 1` against a BLAST db of the concatenated `config/databases.tsv` FASTAs. On a test set, word size 16 found as many hits as full `blastn` (766 vs 768 queries) at about 1/5 the runtime. |
-| 4 | `classify_nested.py` | Joins hits back onto every cluster and classifies each one (below). The class depends on the cluster's own `side` and `is_element`, not only on its sequence. |
-| — | `run_rest.sh` | Runs steps 2–4 in order. |
-
-Hits must have ≥ 90% identity and ≥ 30 bp aligned. A hit "reaches the junction" if
-its alignment ends within 5 bp of the overhang's junction end. Classes, using the
-best-bitscore reaching hit:
+Thresholds are in the `nested_is:` section of `config/config.yaml`. Defaults: hits
+must have ≥ 90% identity (`min_pident`) and ≥ 30 bp aligned (`min_aln`). A hit
+"reaches the junction" if its alignment ends within 5 bp (`junction_tol`) of the
+overhang's junction end. Classes, using the best-bitscore reaching hit:
 
 | class | meaning |
 |---|---|
@@ -117,33 +131,35 @@ site, in a large share of samples are often not nesting. The host's database ent
 may stop short of the real element, so its flank runs on into a related element.
 Check these, and close relatives such as ISEc83/ISEc84 vs ISEc8, by hand.
 
-**Outputs** (`--out_prefix nested_is`):
-- `nested_is.clusters.tsv.gz`: one row per no_hit cluster, with the class and the
+**Outputs** (under `output_dir`):
+- `nested_is/{id}.tsv.gz`: one row per no_hit cluster, with the class and the
   target (`target`, `target_db`, `target_len`). It also has the junction position
   inside the target (`junction_pos`, `dist_to_target_end`), `sstrand` and
   `paired_in_target`. Alignment stats are `pident`, `aln_len`, `qcov`, `bitscore`,
   `evalue`, plus `n_tied`/`tied_targets` for equal-bitscore hits.
-- `nested_is.class_summary.tsv`: clusters and samples per class.
-- `nested_is.host_target_summary.tsv`: one row per (host, target, class) for
+  Header only if the sample has no no_hit clusters.
+- `nested_is_summary/class_summary.tsv`: clusters and samples per class.
+- `nested_is_summary/host_target_summary.tsv`: one row per (host, target, class) for
   `internal`/`terminal` clusters, with `n_samples`, `n_samples_paired` and
   `n_left`/`n_right`. It also has `n_sites` (distinct junction positions, grouped
-  where ≤ 20 bp apart), `top_site` and `median_pident`. Start here.
+  where ≤ `pair_tol` apart), `top_site` and `median_pident`. Sorted by
+  `n_samples_paired`. Start here.
 
-**Running it.** Scripts take paths as arguments and use the `bakta` env's Python
-(pandas). `blastn`/`makeblastdb` come from the `blast` env. From the output folder:
+**Running it outside the pipeline.** Use this for a finished run whose intermediates
+were archived, where Snakemake would want to rebuild everything upstream.
+`nested_is.py --zip_dir` reads every zip in a folder and BLASTs all samples at once,
+deduplicating sequences across samples:
 
 ```
-mkdir -p db
-cat <IS fasta> <Tn fasta> > db/IS_Tn.fa                     # the FASTAs in config/databases.tsv
-makeblastdb -in db/IS_Tn.fa -dbtype nucl -out db/IS_Tn -parse_seqids
-# db/elements.tsv: name<TAB>database label<TAB>length, one line per element
-python scripts/extract_no_hit.py <output_dir>/gene_disruption_paired no_hit_clusters.tsv.gz
-./scripts/run_rest.sh                                        # THREADS=n to multithread BLAST
+python scripts/nested_is.py --zip_dir <output_dir>/gene_disruption_paired \
+    --blastdb <index_dir>/nested_is/IS_Tn --references <index_dir>/references.tsv \
+    --output nested_is.clusters.tsv.gz --threads 4
+python scripts/summarize_nested_is.py --tables nested_is.clusters.tsv.gz --output_dir .
 ```
 
-On the ecoli_summer run (148,743 samples, 7.3M no_hit clusters, 3.3M unique queries),
-extraction took ~15 min and BLAST + classification ~30 min on one core. The first run
-and its scripts are in `/n/scratch/users/h/hua575/ecoli_summer/nested_is/`.
+Use the `bakta` env's Python (pandas). On ecoli_summer (148,743 samples, 7.3M no_hit
+clusters, 3.3M unique sequences) this took ~45 min on one core. Those results are in
+`/n/scratch/users/h/hua575/ecoli_summer/nested_is/`.
 
 ## Repository layout
 
@@ -164,6 +180,8 @@ Scripts invoked by the Snakefile, plus downstream analysis run standalone.
 | `cluster_and_align_by_is.py` | Same idea scoped to specific IS elements: pools raw overhangs for those elements across all accessions, re-clusters, BLASTs, and pairs junctions. |
 | `pool_reps_min_size.py` | Filters existing per-accession cluster reps by minimum cluster size and merges them into one FASTA (no re-clustering). |
 | `plot_left_right_overhangs_per_is.py` | One scatter plot per IS element: genome-by-genome left vs. right deduplicated overhang counts. |
+| `nested_is.py` | BLASTs one sample's (or a folder of samples') `no_hit` overhang clusters against the IS/Tn databases and classifies nested insertions. Used by the `nested_is` rule. |
+| `summarize_nested_is.py` | Combines `nested_is.py` tables into class and host→target summaries. Used by `summarize_nested_is`. |
 | `summarize_gene_disruption_v2.py` | Streams every `gene_disruption/*.zip` and tallies cluster counts by `hit_type` and pairing status. |
 | `build_atb_species_table.py` | For a given species, builds the accession list (ATB query → BioSample IDs → SRA coverage filter) that feeds the Snakefile's `ACCESSIONS_PATH`. |
 | `reads.ipynb` | Exploratory notebook from early pipeline development (minibwa hit counts, gbff parsing, insertion-site BAM inspection). |
@@ -256,13 +274,6 @@ the HMS O2 cluster but aren't checked in:
   concatenating across accessions without producing absurdly large files, and
   cross-referencing the cluster info, original reads/overhang info, and gene hits
   together rather than as separate outputs.
-- **Make nested-IS detection a Snakemake step.** Planned: a `build_nested_is_db`
-  rule (concatenate `config/databases.tsv`, `makeblastdb` in `index_dir`), a
-  per-sample `nested_is` rule after `add_pairing_column` (steps 1–4 above in one
-  script, grouped with `gene_disruption`), and a `summarize_nested_is` rule writing the
-  class and host→target summaries. Thresholds would go in a `nested_is:` config
-  section. Per-sample BLAST loses cross-sample dedup (~2× the queries) but lets new
-  samples run incrementally.
 - **Broaden the reference genome set.** Align against a phylogenetically diverse set
   of reference genomes (e.g. ~100) and compare what's conserved vs. not, instead of
   just the current 6.

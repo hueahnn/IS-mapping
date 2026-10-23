@@ -180,11 +180,22 @@ RECRUIT_EDIT_FRAC = _number("clustering", "recruit_edit_frac")
 # place overhangs to satisfy a rule the pairing step then rejects.
 MAX_PAIR_GAP = _number("max_pair_gap", kind=int)
 
+# nested IS insertions (scripts/nested_is.py)
+NESTED_MIN_LEN = _number("nested_is", "min_len", kind=int)
+NESTED_MIN_PIDENT = _number("nested_is", "min_pident")
+NESTED_MIN_ALN = _number("nested_is", "min_aln", kind=int)
+NESTED_JUNCTION_TOL = _number("nested_is", "junction_tol", kind=int)
+NESTED_TERMINAL_TOL = _number("nested_is", "terminal_tol", kind=int)
+NESTED_PAIR_TOL = _number("nested_is", "pair_tol", kind=int)
+
 # software
 SRA_TOOLS_ENV = _existing(_setting("conda_envs", "sra_tools"), "conda env file 'sra_tools'")
 MINIBWA_ENV = _existing(_setting("conda_envs", "minibwa"), "conda env file 'minibwa'")
 PYTHON_PYSAM = _existing(_setting("python", "pysam"), "python interpreter 'pysam'")
 PYTHON_PANDAS = _existing(_setting("python", "pandas"), "python interpreter 'pandas'")
+BLAST_BIN = _setting("blast_bin")
+BLASTN = _existing(os.path.join(BLAST_BIN, "blastn"), "blastn") if BLAST_BIN else None
+MAKEBLASTDB = _existing(os.path.join(BLAST_BIN, "makeblastdb"), "makeblastdb") if BLAST_BIN else None
 
 if _problems:
 	raise WorkflowError("Problems with the pipeline configuration:\n  - " + "\n  - ".join(_problems)
@@ -216,6 +227,11 @@ CLUSTER_DIR = os.path.join(OUTPUT_DIR, "clusters")                      # clip_a
 RECRUITED_DIR = os.path.join(OUTPUT_DIR, "clusters_recruited")          # recruit_ambiguous, blast_clusters_to_ref
 GENE_DISRUPTION_DIR = os.path.join(OUTPUT_DIR, "gene_disruption")       # blast_clusters_to_ref
 PAIRED_DIR = os.path.join(OUTPUT_DIR, "gene_disruption_paired")         # add_pairing_column
+NESTED_DIR = os.path.join(OUTPUT_DIR, "nested_is")                      # nested_is
+NESTED_SUMMARY_DIR = os.path.join(OUTPUT_DIR, "nested_is_summary")      # summarize_nested_is
+# BLAST db of every configured database, for nested_is. Built from the
+# index_database copies, so it always matches what the reads were aligned to.
+NESTED_BLASTDB = os.path.join(INDEX_DIR, "nested_is", "IS_Tn")          # nested_is_db, nested_is
 
 # Each configured database is copied and indexed by index_database, and every
 # sample is mapped to each one SEPARATELY by bwa_isfinder, then merged.
@@ -247,7 +263,9 @@ rule all:
 		expand(os.path.join(CLUSTER_DIR, "{id}.tar.gz"), id=ACCESSIONS), # overhang clustering + archiving
 		expand(os.path.join(RECRUITED_DIR, "{id}", "{id}.cluster_coverage.tsv"), id=ACCESSIONS), # per-cluster counts after ambiguous-read recruitment
 		expand(os.path.join(GENE_DISRUPTION_DIR, "{id}.zip"), id=ACCESSIONS), # BLAST clusters against masked ref genomes, classify gene disruptions
-		expand(os.path.join(PAIRED_DIR, "{id}.zip"), id=ACCESSIONS) # pair up left/right overhang clusters at the same junction
+		expand(os.path.join(PAIRED_DIR, "{id}.zip"), id=ACCESSIONS), # pair up left/right overhang clusters at the same junction
+		expand(os.path.join(NESTED_DIR, "{id}.tsv.gz"), id=ACCESSIONS), # unplaced overhangs BLASTed against the IS/Tn databases
+		os.path.join(NESTED_SUMMARY_DIR, "host_target_summary.tsv") # nested-insertion candidates across all samples
 
 # Reads come either from the samples table (your own fastqs, copied in
 # uncompressed so every later rule sees the same {id}_1/_2.fastq layout fasterq
@@ -836,3 +854,96 @@ rule add_pairing_column:
 
 		{PYTHON_PYSAM} {input.script} --zip {input.zip} --out-dir {PAIRED_DIR} --max-gap {MAX_PAIR_GAP}
 		"""
+
+
+# BLAST db for nested_is: every configured database (the index_database
+# copies, so it matches what the reads were aligned to) in one db. Depends on
+# REFERENCES_TSV so reference_table's shared-name check has passed first --
+# nested_is reports targets by name alone.
+rule nested_is_db:
+	input:
+		fastas=expand(os.path.join(INDEX_DIR, "{db}.fa"), db=DATABASES),
+		references=REFERENCES_TSV
+	output:
+		NESTED_BLASTDB + ".nsq"
+	log:
+		"logs/nested_is_db/nested_is_db.log"
+	resources:
+		runtime="15m",
+		mem="2G"
+	shell:
+		"""
+		set -euo pipefail
+		exec > {log} 2>&1
+
+		cat {input.fastas} > {NESTED_BLASTDB}.fa
+		{MAKEBLASTDB} -in {NESTED_BLASTDB}.fa -dbtype nucl -out {NESTED_BLASTDB} -parse_seqids
+		"""
+
+
+# Nested IS insertions: the overhang clusters blast_clusters_to_ref left as
+# no_hit (their flank matched none of the IS-masked reference genomes) are
+# BLASTed against the IS/Tn databases, to find host elements whose flank lands
+# inside another element. One per-cluster table per sample; see
+# scripts/nested_is.py's header for the classes. A few seconds per sample, so
+# these are bundled into one SLURM submission (slurmprofile/config.yaml,
+# group-components: nested_is).
+rule nested_is:
+	group: "nested_is"
+	input:
+		zip=os.path.join(PAIRED_DIR, "{id}.zip"),
+		blastdb=NESTED_BLASTDB + ".nsq",
+		references=REFERENCES_TSV,
+		script=os.path.join(SCRIPT_DIR, "scripts", "nested_is.py")
+	output:
+		os.path.join(NESTED_DIR, "{id}.tsv.gz")
+	log:
+		"logs/nested_is/{id}.log"
+	resources:
+		runtime="5m",
+		mem="1G"
+	threads: 1
+	shell:
+		"""
+		set -euo pipefail
+		exec > {log} 2>&1
+
+		{PYTHON_PANDAS} {input.script} \
+			--zips {input.zip} \
+			--blastdb {NESTED_BLASTDB} \
+			--references {input.references} \
+			--output {output} \
+			--blastn {BLASTN} \
+			--threads {threads} \
+			--tmp_dir {resources.tmpdir} \
+			--min_len {NESTED_MIN_LEN} --min_pident {NESTED_MIN_PIDENT} \
+			--min_aln {NESTED_MIN_ALN} --junction_tol {NESTED_JUNCTION_TOL} \
+			--terminal_tol {NESTED_TERMINAL_TOL} --pair_tol {NESTED_PAIR_TOL}
+		"""
+
+
+# Combines every sample's nested_is table into class_summary.tsv (clusters per
+# class) and host_target_summary.tsv (one row per host -> target pair of
+# nested-insertion candidates; see scripts/summarize_nested_is.py). The table
+# paths go through a list file because ~150k of them overflow a command line.
+rule summarize_nested_is:
+	input:
+		tables=expand(os.path.join(NESTED_DIR, "{id}.tsv.gz"), id=ACCESSIONS),
+		script=os.path.join(SCRIPT_DIR, "scripts", "summarize_nested_is.py")
+	output:
+		classes=os.path.join(NESTED_SUMMARY_DIR, "class_summary.tsv"),
+		host_target=os.path.join(NESTED_SUMMARY_DIR, "host_target_summary.tsv")
+	log:
+		"logs/summarize_nested_is/summarize_nested_is.log"
+	resources:
+		runtime="2h",
+		mem="16G"
+	run:
+		os.makedirs(NESTED_SUMMARY_DIR, exist_ok=True)
+		table_list = os.path.join(NESTED_SUMMARY_DIR, "tables.txt")
+		with open(table_list, "w") as fh:
+			fh.write("\n".join(input.tables) + "\n")
+		shell(
+			"{PYTHON_PANDAS} {input.script} --table_list {table_list} "
+			"--output_dir {NESTED_SUMMARY_DIR} --site_tol {NESTED_PAIR_TOL} > {log} 2>&1"
+		)

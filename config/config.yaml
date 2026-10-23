@@ -111,6 +111,29 @@ clustering:
 max_pair_gap: 50
 
 
+# ---- Nested IS insertions --------------------------------------------------
+
+# Overhangs that matched none of the reference genomes are BLASTed against the
+# IS/Tn databases, to find elements inserted inside other elements (see
+# scripts/nested_is.py).
+nested_is:
+  # Shorter overhangs are too short to place and are not BLASTed.
+  min_len: 30
+  # Minimum percent identity and aligned length of a hit to an element.
+  min_pident: 90
+  min_aln: 30
+  # How close (bp) the alignment must end to the overhang's junction end.
+  junction_tol: 5
+  # Junctions this close (bp) to either end of the target element count as
+  # "terminal" (elements side by side) rather than "internal" (nested).
+  terminal_tol: 20
+  # Max bp between the left and right junction positions inside the target for
+  # the two flanks of one host copy to count as one nested insertion. Tighter
+  # than max_pair_gap: inside an element they are offset only by the target
+  # site duplication.
+  pair_tol: 20
+
+
 # ---- Software --------------------------------------------------------------
 
 # Conda environment files for the download and alignment steps (used with
@@ -125,3 +148,6 @@ python:
   pysam: /home/hua575/miniconda3/envs/minibwa/bin/python
   # needs pandas, biopython and edlib (clustering, BLAST classification)
   pandas: /home/hua575/miniconda3/envs/bakta/bin/python
+
+# Folder holding blastn and makeblastdb (nested IS step).
+blast_bin: /home/hua575/miniconda3/envs/blast/bin
