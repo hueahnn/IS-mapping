@@ -29,6 +29,9 @@ see `scripts/cluster_overhangs_edlib.py`) → `blast_clusters_to_ref`
 Everything you'd change between runs is in two files; the Snakefile itself
 shouldn't need editing.
 
+- **What to run on**: either SRA accessions (`accessions:`, one per line, downloaded
+  automatically) or your own reads (`samples:`, a table of `sample`, `fastq_1`,
+  `fastq_2`; see [`config/samples.example.tsv`](config/samples.example.tsv)).
 - **[`config/config.yaml`](config/config.yaml)**: the accession list, output
   folder, reference genomes, filtering/clustering thresholds and software paths. Each
   setting is commented.

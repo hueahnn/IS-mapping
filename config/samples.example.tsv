@@ -1,0 +1,11 @@
+# Your own reads -- one sample per line, tab-separated.
+#
+#   sample   name used for all of this sample's outputs (letters, digits, _ or -)
+#   fastq_1  reads (or read 1 of a pair); .fastq or .fastq.gz
+#   fastq_2  read 2 of a pair; leave empty for single-end reads
+#
+# Relative paths are relative to the repository root. Lines starting with #
+# are ignored. Point `samples:` in config.yaml (or your own config) at a copy.
+sample	fastq_1	fastq_2
+sampleA	/path/to/sampleA_R1.fastq.gz	/path/to/sampleA_R2.fastq.gz
+sampleB	/path/to/sampleB.fastq.gz	

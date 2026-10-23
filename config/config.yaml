@@ -14,8 +14,21 @@
 
 # ---- What to run on --------------------------------------------------------
 
-# Text file with one SRA run accession per line (e.g. SRR8275060).
+# EITHER your own sequencing reads: a table of sample name and fastq file(s),
+# see config/samples.example.tsv. Leave empty ("") to use SRA accessions.
+samples: ""
+
+# OR SRA run accessions to download, one per line (e.g. SRR8275060). Ignored
+# when `samples` is set.
 accessions: atb/ecoli_atb_sra_accessions.txt
+
+# OR overhangs already extracted by an earlier run: a folder of {sample}.tar.gz
+# overhang archives (the overhangs/{sample}.tar.gz files this pipeline writes).
+# When set, every sample with an archive there is run from clustering onward --
+# no download, alignment or clipping -- and the archives are only read, never
+# moved. There are no fastqs to count, so read_stats is skipped and the
+# est_coverage/coverage_fraction columns stay empty. Leave empty ("") otherwise.
+existing_overhangs: ""
 
 # Table of IS / transposon databases to align reads to -- see
 # config/databases.tsv for the format.

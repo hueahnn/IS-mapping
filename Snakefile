@@ -94,8 +94,44 @@ def _read_databases(path):
 	return databases
 
 
-# what to run on
-ACCESSIONS_PATH = _existing(_setting("accessions"), "accession list")
+def _read_samples(path):
+	"""sample -> [fastq_1] or [fastq_1, fastq_2] from a samples table."""
+	samples = {}
+	if path is None or not os.path.exists(path):
+		return samples
+	with open(path) as fh:
+		rows = csv.DictReader((l for l in fh if l.strip() and not l.startswith("#")), delimiter="\t")
+		missing = {"sample", "fastq_1"} - set(rows.fieldnames or [])
+		if missing:
+			_problems.append(f"{path}: header line must have columns 'sample', 'fastq_1' and "
+							 f"optionally 'fastq_2' (tab-separated), missing {sorted(missing)}")
+			return samples
+		for n, row in enumerate(rows, start=1):
+			name = (row["sample"] or "").strip()
+			fastqs = [(row.get(c) or "").strip() for c in ("fastq_1", "fastq_2")]
+			fastqs = [f for f in fastqs if f]
+			if not re.fullmatch(r"[A-Za-z0-9_-]+", name):
+				_problems.append(f"{path}, sample {n}: name {name!r} may only contain "
+								 "letters, digits, '_' or '-'")
+			elif name in samples:
+				_problems.append(f"{path}: sample {name!r} is listed twice")
+			elif not fastqs:
+				_problems.append(f"{path}: sample {name!r} has no fastq_1")
+			else:
+				samples[name] = [_existing(f, f"reads for sample {name!r}") for f in fastqs]
+	if not samples and not any(path in p for p in _problems):
+		_problems.append(f"{path}: no samples listed")
+	return samples
+
+
+# what to run on: overhang archives from an earlier run if given, else your own
+# reads (samples table), else SRA accessions
+EXISTING_OVERHANGS = (_existing(config["existing_overhangs"], "existing overhangs folder")
+					  if config.get("existing_overhangs") else None)
+SAMPLES = (_read_samples(_existing(_setting("samples"), "samples table"))
+		   if config.get("samples") and not EXISTING_OVERHANGS else {})
+ACCESSIONS_PATH = (None if EXISTING_OVERHANGS or SAMPLES or config.get("samples")
+				   else _existing(_setting("accessions"), "accession list"))
 DATABASES = _read_databases(_existing(_setting("databases"), "database table"))
 
 # where to write. Every per-sample output lives under OUTPUT_DIR.
@@ -154,14 +190,24 @@ if _problems:
 	raise WorkflowError("Problems with the pipeline configuration:\n  - " + "\n  - ".join(_problems)
 						+ "\n(settings: config/config.yaml, databases: config/databases.tsv)")
 
-with open(ACCESSIONS_PATH) as f:
-	ACCESSIONS = [line.strip() for line in f if line.strip()]
+if EXISTING_OVERHANGS:
+	ACCESSIONS = sorted(f[:-len(".tar.gz")] for f in os.listdir(EXISTING_OVERHANGS)
+						if f.endswith(".tar.gz") and "." not in f[:-len(".tar.gz")])
+	if not ACCESSIONS:
+		raise WorkflowError(f"no {{sample}}.tar.gz overhang archives in {EXISTING_OVERHANGS}")
+elif SAMPLES:
+	ACCESSIONS = list(SAMPLES)
+else:
+	with open(ACCESSIONS_PATH) as f:
+		ACCESSIONS = [line.strip() for line in f if line.strip()]
 
 FASTQ_DIR = os.path.join(OUTPUT_DIR, "fastq-files")                     # fasterq, bwa_isfinder, remove_fastqs
 BAM_DIR = os.path.join(OUTPUT_DIR, "bam-files")                         # bwa_isfinder, clip_and_cluster
 REMOVE_DIR = os.path.join(OUTPUT_DIR, "removed")                        # remove_fastqs
 READ_STATS_DIR = os.path.join(OUTPUT_DIR, "read_stats")                 # read_stats, blast_clusters_to_ref
 OVERHANG_DIR = os.path.join(OUTPUT_DIR, "overhangs")                    # clip_and_cluster
+# where the overhang archives are read from: this run's own, or an earlier run's
+OVERHANG_ARCHIVE = os.path.join(EXISTING_OVERHANGS or OVERHANG_DIR, "{id}.tar.gz")  # recruit_ambiguous, cluster_existing_overhangs
 CLUSTER_DIR = os.path.join(OUTPUT_DIR, "clusters")                      # clip_and_cluster, recruit_ambiguous
 # recruit_ambiguous writes an augmented copy of clusters/{id}/{id}.reads.tsv
 # here, with the ambiguous-MAPQ overhangs folded into the clusters they match.
@@ -191,54 +237,91 @@ wildcard_constraints:
 
 rule all:
 	input:
-		expand(os.path.join(BAM_DIR, "{id}.bam"), id=ACCESSIONS), # make sure bam file is generated
-		expand(os.path.join(REMOVE_DIR, "{id}.layout"), id=ACCESSIONS), # make sure fastq files are deleted
-		expand(os.path.join(READ_STATS_DIR, "{id}.tsv"), id=ACCESSIONS), # read/base counts, captured before the fastqs go
-		expand(os.path.join(OVERHANG_DIR, "{id}.tar.gz"), id=ACCESSIONS), # filtering, extracting, and archiving overhangs
+		# from-overhangs runs skip everything up to and including clipping
+		[] if EXISTING_OVERHANGS else [
+			expand(os.path.join(BAM_DIR, "{id}.bam"), id=ACCESSIONS), # make sure bam file is generated
+			expand(os.path.join(REMOVE_DIR, "{id}.layout"), id=ACCESSIONS), # make sure fastq files are deleted
+			expand(os.path.join(READ_STATS_DIR, "{id}.tsv"), id=ACCESSIONS), # read/base counts, captured before the fastqs go
+			expand(os.path.join(OVERHANG_DIR, "{id}.tar.gz"), id=ACCESSIONS), # filtering, extracting, and archiving overhangs
+		],
 		expand(os.path.join(CLUSTER_DIR, "{id}.tar.gz"), id=ACCESSIONS), # overhang clustering + archiving
 		expand(os.path.join(RECRUITED_DIR, "{id}", "{id}.cluster_coverage.tsv"), id=ACCESSIONS), # per-cluster counts after ambiguous-read recruitment
 		expand(os.path.join(GENE_DISRUPTION_DIR, "{id}.zip"), id=ACCESSIONS), # BLAST clusters against masked ref genomes, classify gene disruptions
 		expand(os.path.join(PAIRED_DIR, "{id}.zip"), id=ACCESSIONS) # pair up left/right overhang clusters at the same junction
 
-rule prefetch:
-	group: "align_is"
-	output:
-		temp(os.path.join(OUTPUT_DIR, "{id}", "{id}.sra"))
-	log:
-		"logs/prefetch/{id}.log"
-	resources:
-		runtime="5m",
-		mem_mb=100
-	conda: SRA_TOOLS_ENV
-	shell:
-		"""
-		prefetch {wildcards.id} --output-directory {OUTPUT_DIR} > {log} 2>&1
-		"""
+# Reads come either from the samples table (your own fastqs, copied in
+# uncompressed so every later rule sees the same {id}_1/_2.fastq layout fasterq
+# produces -- remove_fastqs later deletes only these copies, never the
+# originals) or from SRA (prefetch + fasterq).
+if SAMPLES:
+	rule import_fastqs:
+		group: "align_is"
+		input:
+			lambda wc: SAMPLES[wc.id]
+		output:
+			layout=os.path.join(FASTQ_DIR, "{id}.layout")
+		log:
+			"logs/import_fastqs/{id}.log"
+		resources:
+			runtime="30m",
+			mem="500M"
+		shell:
+			"""
+			set -euo pipefail
+			exec > {log} 2>&1
+			mkdir -p {FASTQ_DIR}
 
-rule fasterq:
-	group: "align_is"
-	input:
-		os.path.join(OUTPUT_DIR, "{id}", "{id}.sra")
-	output:
-		layout=os.path.join(FASTQ_DIR, "{id}.layout")
-	log:
-		"logs/fasterq/{id}.log"
-	resources:
-		runtime="10m",
-		mem="1G"
-	conda: SRA_TOOLS_ENV
-	shell:
-		"""
-		set -euo pipefail
+			# zcat -f passes uncompressed input through unchanged
+			set -- {input}
+			if [ $# -eq 2 ]; then
+				zcat -f "$1" > {FASTQ_DIR}/{wildcards.id}_1.fastq
+				zcat -f "$2" > {FASTQ_DIR}/{wildcards.id}_2.fastq
+				echo "paired" > {output.layout}
+			else
+				zcat -f "$1" > {FASTQ_DIR}/{wildcards.id}.fastq
+				echo "single" > {output.layout}
+			fi
+			"""
+else:
+	rule prefetch:
+		group: "align_is"
+		output:
+			temp(os.path.join(OUTPUT_DIR, "{id}", "{id}.sra"))
+		log:
+			"logs/prefetch/{id}.log"
+		resources:
+			runtime="5m",
+			mem_mb=100
+		conda: SRA_TOOLS_ENV
+		shell:
+			"""
+			prefetch {wildcards.id} --output-directory {OUTPUT_DIR} > {log} 2>&1
+			"""
 
-		fasterq-dump {input} --outdir {FASTQ_DIR} > {log} 2>&1
+	rule fasterq:
+		group: "align_is"
+		input:
+			os.path.join(OUTPUT_DIR, "{id}", "{id}.sra")
+		output:
+			layout=os.path.join(FASTQ_DIR, "{id}.layout")
+		log:
+			"logs/fasterq/{id}.log"
+		resources:
+			runtime="10m",
+			mem="1G"
+		conda: SRA_TOOLS_ENV
+		shell:
+			"""
+			set -euo pipefail
 
-		if [ -f {FASTQ_DIR}/{wildcards.id}_1.fastq ]; then
-			echo "paired" > {output.layout}
-		else
-			echo "single" > {output.layout}
-		fi
-		"""
+			fasterq-dump {input} --outdir {FASTQ_DIR} > {log} 2>&1
+
+			if [ -f {FASTQ_DIR}/{wildcards.id}_1.fastq ]; then
+				echo "paired" > {output.layout}
+			else
+				echo "single" > {output.layout}
+			fi
+			"""
 
 # Copy each configured database into INDEX_DIR and build its minibwa index
 # there, so the index always matches the exact fasta it was built from. Also
@@ -422,7 +505,7 @@ rule read_stats:
 		# which keeps this correct for the paired case regardless of the two
 		# mates' line counts.
 		awk 'FNR % 4 == 2 {{ n++; b += length($0) }}
-		     END {{ printf "sample\tn_reads\ttotal_bases\tmean_read_length\n{wildcards.id}\t%d\t%d\t%.2f\n", n, b, (n ? b / n : 0) }}' \
+		     END {{ printf "sample\\tn_reads\\ttotal_bases\\tmean_read_length\\n{wildcards.id}\\t%d\\t%d\\t%.2f\\n", n, b, (n ? b / n : 0) }}' \
 		    $READS > {output.stats}.tmp 2>> {log}
 		mv {output.stats}.tmp {output.stats}
 		"""
@@ -475,79 +558,137 @@ rule remove_fastqs:
 # intermediates never touch /n/scratch's inode quota: everything lives in the
 # job's local $TMPDIR, and only the small manifests/reads.tsv plus one
 # tar.gz per stage get persisted to scratch.
-rule clip_and_cluster:
-	group: "overhangs"
-	input:
-		bam=os.path.join(BAM_DIR, "{id}.bam"),
-		overhang_script=os.path.join(SCRIPT_DIR, "scripts", "overhangs.py"),
-		cluster_script=os.path.join(SCRIPT_DIR, "scripts", "cluster_overhangs_edlib.py")
-	output:
-		overhang_manifest=os.path.join(OVERHANG_DIR, "{id}", "{id}.manifest.tsv"),
-		overhang_archive=os.path.join(OVERHANG_DIR, "{id}.tar.gz"),
-		cluster_manifest=os.path.join(CLUSTER_DIR, "{id}", "{id}.cluster_manifest.tsv"),
-		reads_tsv=os.path.join(CLUSTER_DIR, "{id}", "{id}.reads.tsv"),
-		cluster_archive=os.path.join(CLUSTER_DIR, "{id}.tar.gz")
-	log:
-		"logs/clip_and_cluster/{id}.log"
-	resources:
-		runtime="15m",
-		mem="500M"
-	shell:
-		"""
-		set -euo pipefail
-		exec > {log} 2>&1
+if not EXISTING_OVERHANGS:
+	rule clip_and_cluster:
+		group: "overhangs"
+		input:
+			bam=os.path.join(BAM_DIR, "{id}.bam"),
+			overhang_script=os.path.join(SCRIPT_DIR, "scripts", "overhangs.py"),
+			cluster_script=os.path.join(SCRIPT_DIR, "scripts", "cluster_overhangs_edlib.py")
+		output:
+			overhang_manifest=os.path.join(OVERHANG_DIR, "{id}", "{id}.manifest.tsv"),
+			overhang_archive=os.path.join(OVERHANG_DIR, "{id}.tar.gz"),
+			cluster_manifest=os.path.join(CLUSTER_DIR, "{id}", "{id}.cluster_manifest.tsv"),
+			reads_tsv=os.path.join(CLUSTER_DIR, "{id}", "{id}.reads.tsv"),
+			cluster_archive=os.path.join(CLUSTER_DIR, "{id}.tar.gz")
+		log:
+			"logs/clip_and_cluster/{id}.log"
+		resources:
+			runtime="15m",
+			mem="500M"
+		shell:
+			"""
+			set -euo pipefail
+			exec > {log} 2>&1
 
-		WORK={resources.tmpdir}/clip_and_cluster.{wildcards.id}.$$
-		OVERHANG_WORK="$WORK/overhangs"
-		CLUSTER_WORK="$WORK/clusters"
-		mkdir -p "$OVERHANG_WORK" "$CLUSTER_WORK"
-		trap 'rm -rf "$WORK"' EXIT
+			WORK={resources.tmpdir}/clip_and_cluster.{wildcards.id}.$$
+			OVERHANG_WORK="$WORK/overhangs"
+			CLUSTER_WORK="$WORK/clusters"
+			mkdir -p "$OVERHANG_WORK" "$CLUSTER_WORK"
+			trap 'rm -rf "$WORK"' EXIT
 
-		# stage 1: clip overhangs from the bam (needs pysam/samtools -- minibwa env)
-		{PYTHON_PYSAM} {input.overhang_script} \
-			{input.bam} "$OVERHANG_WORK" --sample_id {wildcards.id} --skip_is_hit_filter \
-			--min_is_coverage_depth {MIN_ELEMENT_COVERAGE_DEPTH} \
-			--min_is_coverage_fraction {MIN_ELEMENT_COVERAGE_FRACTION} \
-			--min_mapq {MIN_MAPQ} --min_pident {MIN_PIDENT} \
-			--min_clip_len {MIN_CLIP_LEN} --boundary_tolerance {BOUNDARY_TOLERANCE}
+			# stage 1: clip overhangs from the bam (needs pysam/samtools -- minibwa env)
+			{PYTHON_PYSAM} {input.overhang_script} \
+				{input.bam} "$OVERHANG_WORK" --sample_id {wildcards.id} --skip_is_hit_filter \
+				--min_is_coverage_depth {MIN_ELEMENT_COVERAGE_DEPTH} \
+				--min_is_coverage_fraction {MIN_ELEMENT_COVERAGE_FRACTION} \
+				--min_mapq {MIN_MAPQ} --min_pident {MIN_PIDENT} \
+				--min_clip_len {MIN_CLIP_LEN} --boundary_tolerance {BOUNDARY_TOLERANCE}
 
-		# stage 2: cluster each is_element/side pair with a position-anchored edit
-		# distance (edlib SHW/prefix mode) instead of CD-HIT's percent-identity +
-		# coverage-threshold approach -- see cluster_overhangs_edlib.py's module
-		# docstring for the anchoring/algorithm rationale. One script call replaces
-		# both the old cd-hit-est loop and the old combine_cdhit_clusters.py step.
-		#
-		# TODO(infra): `edlib` (pip install edlib, pure C++ ext, no Rust toolchain)
-		# is not yet installed in the bakta env -- add it there before this rule
-		# will run (bakta already has pandas, needed here too, so reusing it avoids
-		# a new env). Set python: pandas in config/config.yaml if a different env is used.
-		{PYTHON_PANDAS} {input.cluster_script} \
-			"$OVERHANG_WORK/{wildcards.id}.manifest.tsv" \
-			--sample_id {wildcards.id} \
-			--output_dir "$CLUSTER_WORK" \
-			--max_edit_frac {MAX_EDIT_FRAC} --merge_edit_frac {MERGE_EDIT_FRAC} \
-			--min_cluster_size {MIN_CLUSTER_SIZE}
+			# stage 2: cluster each is_element/side pair with a position-anchored edit
+			# distance (edlib SHW/prefix mode) instead of CD-HIT's percent-identity +
+			# coverage-threshold approach -- see cluster_overhangs_edlib.py's module
+			# docstring for the anchoring/algorithm rationale. One script call replaces
+			# both the old cd-hit-est loop and the old combine_cdhit_clusters.py step.
+			#
+			# TODO(infra): `edlib` (pip install edlib, pure C++ ext, no Rust toolchain)
+			# is not yet installed in the bakta env -- add it there before this rule
+			# will run (bakta already has pandas, needed here too, so reusing it avoids
+			# a new env). Set python: pandas in config/config.yaml if a different env is used.
+			{PYTHON_PANDAS} {input.cluster_script} \
+				"$OVERHANG_WORK/{wildcards.id}.manifest.tsv" \
+				--sample_id {wildcards.id} \
+				--output_dir "$CLUSTER_WORK" \
+				--max_edit_frac {MAX_EDIT_FRAC} --merge_edit_frac {MERGE_EDIT_FRAC} \
+				--min_cluster_size {MIN_CLUSTER_SIZE}
 
-		# persist only the small, useful results. cluster_overhangs_edlib.py's
-		# manifest (is_element/side/n_in/n_clusters) carries no tmpdir-relative
-		# paths, so the sed below is a no-op pass-through today -- kept so this
-		# still self-documents/rewrites correctly if a future manifest column ever
-		# does reference $CLUSTER_WORK-relative paths again.
-		mkdir -p "{OVERHANG_DIR}/{wildcards.id}" "{CLUSTER_DIR}/{wildcards.id}"
-		cp "$OVERHANG_WORK/{wildcards.id}.manifest.tsv" {output.overhang_manifest}
-		sed "s|$CLUSTER_WORK/|{CLUSTER_DIR}/{wildcards.id}/|g" \
-			"$CLUSTER_WORK/{wildcards.id}.cluster_manifest.tsv" > {output.cluster_manifest}
-		cp "$CLUSTER_WORK/{wildcards.id}.reads.tsv" {output.reads_tsv}
+			# persist only the small, useful results. cluster_overhangs_edlib.py's
+			# manifest (is_element/side/n_in/n_clusters) carries no tmpdir-relative
+			# paths, so the sed below is a no-op pass-through today -- kept so this
+			# still self-documents/rewrites correctly if a future manifest column ever
+			# does reference $CLUSTER_WORK-relative paths again.
+			mkdir -p "{OVERHANG_DIR}/{wildcards.id}" "{CLUSTER_DIR}/{wildcards.id}"
+			cp "$OVERHANG_WORK/{wildcards.id}.manifest.tsv" {output.overhang_manifest}
+			sed "s|$CLUSTER_WORK/|{CLUSTER_DIR}/{wildcards.id}/|g" \
+				"$CLUSTER_WORK/{wildcards.id}.cluster_manifest.tsv" > {output.cluster_manifest}
+			cp "$CLUSTER_WORK/{wildcards.id}.reads.tsv" {output.reads_tsv}
 
-		# archive the raw intermediates -- built once, verified, then moved into place
-		tar -C "$OVERHANG_WORK" -czf {output.overhang_archive}.tmp .
-		tar -tzf {output.overhang_archive}.tmp > /dev/null
-		mv {output.overhang_archive}.tmp {output.overhang_archive}
+			# archive the raw intermediates -- built once, verified, then moved into place
+			tar -C "$OVERHANG_WORK" -czf {output.overhang_archive}.tmp .
+			tar -tzf {output.overhang_archive}.tmp > /dev/null
+			mv {output.overhang_archive}.tmp {output.overhang_archive}
 
-		tar -C "$CLUSTER_WORK" -czf {output.cluster_archive}.tmp .
-		tar -tzf {output.cluster_archive}.tmp > /dev/null
-		mv {output.cluster_archive}.tmp {output.cluster_archive}
-		"""
+			tar -C "$CLUSTER_WORK" -czf {output.cluster_archive}.tmp .
+			tar -tzf {output.cluster_archive}.tmp > /dev/null
+			mv {output.cluster_archive}.tmp {output.cluster_archive}
+			"""
+else:
+	# Clustering half of clip_and_cluster, run on an existing overhang archive
+	# (config: existing_overhangs). Same outputs, so everything downstream is
+	# unchanged. The archive is only read: it is unpacked into the job's
+	# $TMPDIR and left where it is.
+	rule cluster_existing_overhangs:
+		group: "overhangs"
+		input:
+			overhang_archive=OVERHANG_ARCHIVE,
+			cluster_script=os.path.join(SCRIPT_DIR, "scripts", "cluster_overhangs_edlib.py")
+		output:
+			cluster_manifest=os.path.join(CLUSTER_DIR, "{id}", "{id}.cluster_manifest.tsv"),
+			reads_tsv=os.path.join(CLUSTER_DIR, "{id}", "{id}.reads.tsv"),
+			cluster_archive=os.path.join(CLUSTER_DIR, "{id}.tar.gz")
+		log:
+			"logs/cluster_existing_overhangs/{id}.log"
+		resources:
+			runtime="15m",
+			mem="500M"
+		shell:
+			"""
+			set -euo pipefail
+			exec > {log} 2>&1
+
+			WORK={resources.tmpdir}/cluster_existing_overhangs.{wildcards.id}.$$
+			OVERHANG_WORK="$WORK/overhangs"
+			CLUSTER_WORK="$WORK/clusters"
+			mkdir -p "$OVERHANG_WORK" "$CLUSTER_WORK"
+			trap 'rm -rf "$WORK"' EXIT
+
+			tar -xzf {input.overhang_archive} -C "$OVERHANG_WORK"
+
+			# the manifest's fasta_path column points at the $TMPDIR of the job
+			# that wrote the archive, long gone -- repoint it at the unpacked copies
+			awk -F '\\t' -v OFS='\\t' -v dir="$OVERHANG_WORK" '
+				NR == 1 {{ for (i = 1; i <= NF; i++) if ($i == "fasta_path") col = i
+				          if (!col) {{ print "no fasta_path column in manifest" > "/dev/stderr"; exit 1 }}
+				          print; next }}
+				$col != "" {{ n = split($col, parts, "/"); $col = dir "/" parts[n] }}
+				{{ print }}
+			' "$OVERHANG_WORK/{wildcards.id}.manifest.tsv" > "$WORK/manifest.tsv"
+
+			{PYTHON_PANDAS} {input.cluster_script} \
+				"$WORK/manifest.tsv" \
+				--sample_id {wildcards.id} \
+				--output_dir "$CLUSTER_WORK" \
+				--max_edit_frac {MAX_EDIT_FRAC} --merge_edit_frac {MERGE_EDIT_FRAC} \
+				--min_cluster_size {MIN_CLUSTER_SIZE}
+
+			mkdir -p "{CLUSTER_DIR}/{wildcards.id}"
+			cp "$CLUSTER_WORK/{wildcards.id}.cluster_manifest.tsv" {output.cluster_manifest}
+			cp "$CLUSTER_WORK/{wildcards.id}.reads.tsv" {output.reads_tsv}
+
+			tar -C "$CLUSTER_WORK" -czf {output.cluster_archive}.tmp .
+			tar -tzf {output.cluster_archive}.tmp > /dev/null
+			mv {output.cluster_archive}.tmp {output.cluster_archive}
+			"""
 
 
 # Recruit the ambiguous-MAPQ overhangs into the clusters built above.
@@ -567,7 +708,7 @@ rule recruit_ambiguous:
 	group: "overhangs"
 	input:
 		reads_tsv=os.path.join(CLUSTER_DIR, "{id}", "{id}.reads.tsv"),
-		overhang_archive=os.path.join(OVERHANG_DIR, "{id}.tar.gz"),
+		overhang_archive=OVERHANG_ARCHIVE,
 		script=os.path.join(SCRIPT_DIR, "scripts", "recruit_ambiguous_overhangs.py")
 	output:
 		reads_tsv=os.path.join(RECRUITED_DIR, "{id}", "{id}.reads.tsv"),
@@ -618,12 +759,15 @@ rule blast_clusters_to_ref:
 		reads_tsv=os.path.join(RECRUITED_DIR, "{id}", "{id}.reads.tsv"),
 		script=os.path.join(SCRIPT_DIR, "scripts", "blast_clusters_to_ref.py"),
 		blastdb_file=BLASTDB + ".nsq",
-		read_stats=os.path.join(READ_STATS_DIR, "{id}.tsv"),
-		genome_sizes=[GENOME_SIZES] if GENOME_SIZES else [],
+		# no fastqs to count in a from-overhangs run (existing_overhangs), so
+		# no read_stats -- est_coverage/coverage_fraction are then left empty
+		read_stats=[] if EXISTING_OVERHANGS else [os.path.join(READ_STATS_DIR, "{id}.tsv")],
+		genome_sizes=[GENOME_SIZES] if GENOME_SIZES and not EXISTING_OVERHANGS else [],
 		ref_gbffs=REF_GBFFS
 	params:
-		# genome_sizes is optional; without it est_coverage/coverage_fraction stay empty
-		genome_sizes_arg=f"--genome_sizes {GENOME_SIZES}" if GENOME_SIZES else ""
+		# both optional; without them est_coverage/coverage_fraction stay empty
+		read_stats_arg=lambda wc, input: f"--read_stats {input.read_stats}" if input.read_stats else "",
+		genome_sizes_arg=lambda wc, input: f"--genome_sizes {input.genome_sizes}" if input.genome_sizes else ""
 	output:
 		os.path.join(GENE_DISRUPTION_DIR, "{id}.zip")
 	log:
@@ -655,9 +799,19 @@ rule blast_clusters_to_ref:
 			--output_dir {GENE_DISRUPTION_DIR} \
 			--tmp_dir "$TMP_DIR" \
 			--threads {threads} \
-			--read_stats {input.read_stats} \
+			{params.read_stats_arg} \
 			{params.genome_sizes_arg} \
 			--max_pair_gap {MAX_PAIR_GAP}
+
+		# a sample with no clusters at all (every element/side under
+		# min_cluster_size) gets no zip from the script -- write an empty one so
+		# it reads as "no insertions" instead of failing the job (and, grouped,
+		# every other sample submitted with it). add_pairing_column passes an
+		# empty zip through as an empty zip.
+		if [ ! -f {output} ]; then
+			{PYTHON_PANDAS} -c "import zipfile, sys; zipfile.ZipFile(sys.argv[1], 'w').close()" {output}
+			echo "no clusters -- wrote empty {output}"
+		fi
 		"""
 
 
