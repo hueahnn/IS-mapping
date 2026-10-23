@@ -26,32 +26,66 @@ see `scripts/cluster_overhangs_edlib.py`) → `blast_clusters_to_ref`
 (gene-disruption classification) → `add_pairing_column` (left/right junction pairing)
 → `nested_is` + `summarize_nested_is` (IS elements inserted inside other elements, see
 [Nested IS insertions](#nested-is-insertions)).
+
 ### Configuration
 
-Everything you'd change between runs is in two files; the Snakefile itself
-shouldn't need editing.
+You never need to edit the Snakefile. Every setting lives in one of two files:
 
-- **What to run on**: either SRA accessions (`accessions:`, one per line, downloaded
-  automatically) or your own reads (`samples:`, a table of `sample`, `fastq_1`,
-  `fastq_2`; see [`config/samples.example.tsv`](config/samples.example.tsv)).
-- **[`config/config.yaml`](config/config.yaml)**: the accession list, output
-  folder, reference genomes, filtering/clustering thresholds and software paths. Each
-  setting is commented.
-- **[`config/databases.tsv`](config/databases.tsv)**: the IS / transposon
-  databases to align reads to, one per line:
+| file | what it sets |
+|---|---|
+| [`config/config.yaml`](config/config.yaml) | What to run on, where outputs go, the reference genomes, every threshold, and software paths. Each setting has a comment explaining it. |
+| [`config/databases.tsv`](config/databases.tsv) | The IS / transposon databases that reads are aligned to. |
 
-  ```
-  label	fasta	description
-  IS	/path/to/is_elements.fa	ISfinder + ISOSDB
-  Tn	/path/to/transposons.fa	TnCentral
-  ```
+Relative paths in either file are relative to the repository root.
 
-To run with different settings, either edit those files or copy `config.yaml`,
-change what you need, and pass it with `--configfile my_config.yaml` (anything
-you leave out keeps its default). One-off overrides work on the command line, e.g.
-`--config accessions=my_list.txt`. Relative paths are relative to the repository root.
-Before running anything, the pipeline checks the configuration and lists every
-problem it finds (missing files, bad labels, non-numeric thresholds).
+#### What to run on
+
+Set **one** of these three in `config.yaml`:
+
+| setting | use it for | what it points to |
+|---|---|---|
+| `accessions:` | SRA runs, downloaded automatically | a text file with one run accession per line (e.g. `SRR8275060`) |
+| `samples:` | your own sequencing reads | a tab-separated table with columns `sample`, `fastq_1` and `fastq_2` (leave `fastq_2` empty for single-end). See [`config/samples.example.tsv`](config/samples.example.tsv). |
+| `existing_overhangs:` | rerunning from clustering onward on a finished run | a folder of `{sample}.tar.gz` overhang archives from an earlier run. Nothing is downloaded or aligned, and the archives are only read. |
+
+If more than one is set, `existing_overhangs` wins over `samples`, which wins over
+`accessions`. Leave the ones you aren't using as `""`.
+
+#### Databases
+
+Each line of `databases.tsv` is one database:
+
+```
+label	fasta	description
+IS	/path/to/is_elements.fa	ISfinder + ISOSDB
+Tn	/path/to/transposons.fa	TnCentral
+```
+
+- **`label`**: a short name (letters, digits, `_` or `-`). It tags every read and
+  overhang, so results can be split by database later.
+- **`fasta`**: the element sequences.
+- **`description`** is optional.
+
+Sequence names must be unique across all databases. See
+[Element databases](#element-databases) for how they are used.
+
+#### Changing settings for one run
+
+You don't have to edit `config.yaml` itself:
+
+- **Several settings:** write a small YAML file with only the settings you want to
+  change and pass it with `--configfile my_run.yaml`. Anything you leave out keeps
+  its value from `config.yaml`. For example,
+  [`config/ecoli_summer.yaml`](config/ecoli_summer.yaml) only sets
+  `existing_overhangs` and `output_dir`.
+- **One setting:** override it on the command line, e.g.
+  `--config accessions=my_list.txt`.
+
+#### Checks before running
+
+The pipeline checks the configuration before it starts any job. It then lists every
+problem at once: missing files, bad database labels or sample names, duplicate
+names, or thresholds that aren't numbers.
 
 ### Element databases
 
