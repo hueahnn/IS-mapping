@@ -71,6 +71,80 @@ Everything else in the repo is analysis run on top of that pipeline's output —
 results across accessions, plotting, summarizing, or re-running a stage at a different
 scope (e.g. per IS element instead of per accession).
 
+## Nested IS insertions
+
+A downstream analysis, not yet a Snakemake rule, that looks for IS elements inserted
+*into other IS elements / transposons*. It starts from the overhang clusters that
+`blast_clusters_to_ref` marks `hit_type == no_hit` (the flank matched none of the
+reference genomes). The reference genomes are IS-masked, so a flank that is itself IS
+sequence ends up as `no_hit`. Each such flank is BLASTed against the same IS + Tn
+databases the reads were aligned to. If the flank of host element X lands inside
+element Y, X may sit inside Y.
+
+**Orientation.** Same convention as `blast_clusters_to_ref.py`: `rep_seq` is in X's
+forward orientation. The junction is the last base of a `left` overhang and the first
+base of a `right` one. So the insertion point inside Y is BLAST's `send` (left) or
+`sstart` (right), in 1-based Y coordinates.
+
+**Steps** (scripts in `nested_is/scripts/`, see below):
+
+| step | script | what it does |
+|---|---|---|
+| 1 | `extract_no_hit.py` | Pulls every `no_hit` row (sample, host element, side, cluster, pairing, `rep_seq`, length, `n_seqs`) out of all `gene_disruption_paired/{id}.zip` files. |
+| 2 | `make_queries.py` | Drops `rep_seq`s under 30 bp and writes each *exactly* identical sequence once as a BLAST query (the same flank recurs across many samples). Near-identical sequences stay separate, and nothing is merged at the cluster level. |
+| 3 | `blastn` | `-task megablast -word_size 16 -evalue 1e-5 -max_target_seqs 50 -max_hsps 1` against a BLAST db of the concatenated `config/databases.tsv` FASTAs. On a test set, word size 16 found as many hits as full `blastn` (766 vs 768 queries) at about 1/5 the runtime. |
+| 4 | `classify_nested.py` | Joins hits back onto every cluster and classifies each one (below). The class depends on the cluster's own `side` and `is_element`, not only on its sequence. |
+| — | `run_rest.sh` | Runs steps 2–4 in order. |
+
+Hits must have ≥ 90% identity and ≥ 30 bp aligned. A hit "reaches the junction" if
+its alignment ends within 5 bp of the overhang's junction end. Classes, using the
+best-bitscore reaching hit:
+
+| class | meaning |
+|---|---|
+| `internal` | junction lands inside Y: **nested-insertion candidate** |
+| `terminal` | junction within 20 bp of either end of Y: X sits next to Y's end rather than interrupting Y |
+| `self` | best hit (or a tie for it) is X itself: tandem copies, IS circles/dimers, or X sequence let in by `boundary_tolerance` |
+| `distal_only` | IS/Tn hits exist but none reaches the junction: host DNA lies between X and Y, so X is near Y, not in it |
+| `no_is_hit` | no passing IS/Tn hit: likely host DNA missing from the 6 references |
+| `too_short` | `rep_seq` under 30 bp, not BLASTed |
+
+`paired_in_target` is the strongest evidence. It is set when the left and right
+clusters of the same host in the same sample land in the same Y, on the same strand,
+with junction positions ≤ 20 bp apart: both flanks of one X copy point into one site
+of Y, offset by its target-site duplication. Targets hit by only one side, at a single
+site, in a large share of samples are often not nesting. The host's database entry
+may stop short of the real element, so its flank runs on into a related element.
+Check these, and close relatives such as ISEc83/ISEc84 vs ISEc8, by hand.
+
+**Outputs** (`--out_prefix nested_is`):
+- `nested_is.clusters.tsv.gz`: one row per no_hit cluster, with the class and the
+  target (`target`, `target_db`, `target_len`). It also has the junction position
+  inside the target (`junction_pos`, `dist_to_target_end`), `sstrand` and
+  `paired_in_target`. Alignment stats are `pident`, `aln_len`, `qcov`, `bitscore`,
+  `evalue`, plus `n_tied`/`tied_targets` for equal-bitscore hits.
+- `nested_is.class_summary.tsv`: clusters and samples per class.
+- `nested_is.host_target_summary.tsv`: one row per (host, target, class) for
+  `internal`/`terminal` clusters, with `n_samples`, `n_samples_paired` and
+  `n_left`/`n_right`. It also has `n_sites` (distinct junction positions, grouped
+  where ≤ 20 bp apart), `top_site` and `median_pident`. Start here.
+
+**Running it.** Scripts take paths as arguments and use the `bakta` env's Python
+(pandas). `blastn`/`makeblastdb` come from the `blast` env. From the output folder:
+
+```
+mkdir -p db
+cat <IS fasta> <Tn fasta> > db/IS_Tn.fa                     # the FASTAs in config/databases.tsv
+makeblastdb -in db/IS_Tn.fa -dbtype nucl -out db/IS_Tn -parse_seqids
+# db/elements.tsv: name<TAB>database label<TAB>length, one line per element
+python scripts/extract_no_hit.py <output_dir>/gene_disruption_paired no_hit_clusters.tsv.gz
+./scripts/run_rest.sh                                        # THREADS=n to multithread BLAST
+```
+
+On the ecoli_summer run (148,743 samples, 7.3M no_hit clusters, 3.3M unique queries),
+extraction took ~15 min and BLAST + classification ~30 min on one core. The first run
+and its scripts are in `/n/scratch/users/h/hua575/ecoli_summer/nested_is/`.
+
 ## Repository layout
 
 ### `Snakefile`
@@ -182,6 +256,13 @@ the HMS O2 cluster but aren't checked in:
   concatenating across accessions without producing absurdly large files, and
   cross-referencing the cluster info, original reads/overhang info, and gene hits
   together rather than as separate outputs.
+- **Make nested-IS detection a Snakemake step.** Planned: a `build_nested_is_db`
+  rule (concatenate `config/databases.tsv`, `makeblastdb` in `index_dir`), a
+  per-sample `nested_is` rule after `add_pairing_column` (steps 1–4 above in one
+  script, grouped with `gene_disruption`), and a `summarize_nested_is` rule writing the
+  class and host→target summaries. Thresholds would go in a `nested_is:` config
+  section. Per-sample BLAST loses cross-sample dedup (~2× the queries) but lets new
+  samples run incrementally.
 - **Broaden the reference genome set.** Align against a phylogenetically diverse set
   of reference genomes (e.g. ~100) and compare what's conserved vs. not, instead of
   just the current 6.
